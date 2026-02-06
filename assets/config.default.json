@@ -1,0 +1,148 @@
+{
+  // Anode ClawdBot Default Configuration
+  // This file uses JSON5 format (comments and trailing commas are allowed)
+
+  // Model configuration
+  model: {
+    // AI provider: 'anthropic', 'openai', or 'gemini'
+    provider: 'anthropic',
+
+    // Model name
+    model: 'claude-sonnet-4-5-20250929',
+
+    // API key - can use environment variable substitution
+    // Set ANTHROPIC_API_KEY environment variable or replace ${ANTHROPIC_API_KEY} with your key
+    apiKey: '${ANTHROPIC_API_KEY}',
+
+    // Optional: Custom API base URL
+    // baseURL: 'https://api.anthropic.com',
+
+    // Maximum tokens per request
+    maxTokens: 4096,
+
+    // Temperature (0.0 to 2.0)
+    temperature: 1.0,
+  },
+
+  // Storage configuration
+  storage: {
+    // Directory for session files
+    sessionDir: './data/sessions',
+
+    // Directory for memory/context files
+    memoryDir: './data/memory',
+
+    // Maximum session file size (bytes)
+    maxSessionSize: 10485760, // 10MB
+
+    // Enable compression for large sessions
+    compressionEnabled: true,
+  },
+
+  // Agent behavior configuration
+  agent: {
+    // Default system prompt
+    defaultSystemPrompt: 'You are a helpful AI assistant running on an Android device. You have access to various tools to help users automate tasks and interact with their device. Always be concise and helpful.',
+
+    // Token count to show context warning (approaching limit)
+    contextWindowWarning: 3500,
+
+    // Maximum context window size (tokens)
+    contextWindowMax: 4000,
+
+    // Enable automatic context compression
+    compressionEnabled: true,
+
+    // Auto-save sessions after each message
+    autoSave: true,
+
+    // Maximum tool execution iterations per message (to prevent infinite loops)
+    // Increase if complex queries hit the limit
+    maxToolIterations: 20,
+  },
+
+  // Safety and approval configuration
+  safety: {
+    // Enable safety system
+    enabled: true,
+
+    // Trust mode:
+    // - 'yolo': Auto-approve all tool calls (no approval needed)
+    // - 'permissive': Only require approval for critical operations
+    // - 'moderate': Require approval for medium/high/critical operations (default)
+    // - 'strict': Require approval for all operations except safe ones
+    trustMode: 'yolo',
+
+    // Approval timeout in milliseconds (default: 60000 = 1 minute)
+    approvalTimeout: 120000,
+
+    // Chat ID for sending approval requests (required for non-yolo mode)
+    // Get this by sending a message to your bot and checking the logs
+    approvalChatId: '',
+
+    // Platform for approval requests ('telegram', 'discord', etc.)
+    approvalPlatform: 'telegram',
+  },
+
+  // UI configuration
+  ui: {
+    // Theme: 'light', 'dark', or 'auto'
+    theme: 'auto',
+
+    // Floating window settings
+    floatingWindow: {
+      width: 700,
+      height: 1000,
+      x: 50,
+      y: 100,
+    },
+
+    // Notification settings
+    notifications: {
+      enabled: true,
+      showProgress: true,
+    },
+  },
+
+  // Social platform configuration (optional)
+  social: {
+    // Telegram Bot
+    telegram: {
+      enabled: false,
+      botToken: '', // Bot token from @BotFather
+    },
+
+    // QQ Guild Bot
+    qq: {
+      enabled: false,
+      appId: '', // QQ Guild App ID
+      token: '', // QQ Guild Token
+    },
+
+    // WeChat (Wechaty)
+    wechat: {
+      enabled: false,
+      // Wechaty 自动登录，无需额外配置
+    },
+
+    // Discord Bot
+    discord: {
+      enabled: false,
+      botToken: '', // Discord Bot Token
+    },
+
+    // Feishu (飞书) Bot
+    feishu: {
+      enabled: false,
+      appId: '', // Feishu App ID
+      appSecret: '', // Feishu App Secret
+    },
+
+    // DingTalk (钉钉) Bot
+    dingtalk: {
+      enabled: false,
+      appKey: '', // DingTalk App Key
+      appSecret: '', // DingTalk App Secret
+    },
+  },
+}

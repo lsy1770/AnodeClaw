@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Documentation
+docs/
+
+# Test files
+tests/
+*.test.ts
+*.spec.ts
+src/test-*.ts
+
+# Design documents (keep only README.md and CLAUDE.md)
+ACS-ClawdBot-Development-Plan.md
+Advanced-Features-Design.md
+Operational-Patterns-Design.md
+OpenClaw.md
+PROJECT-STATUS.md
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Session data (runtime)
+sessions/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# npm debug
+npm-debug.log*
