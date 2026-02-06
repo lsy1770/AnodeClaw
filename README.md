@@ -1,6 +1,6 @@
 # Anode ClawdBot
 
-Android AI Agent System powered by Claude, running on ACS platform with Javet Node.js engine.
+Android AI Agent System, running on ACS platform with Javet Node.js engine.
 
 ## Features
 
