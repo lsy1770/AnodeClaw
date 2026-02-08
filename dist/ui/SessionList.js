@@ -95,41 +95,51 @@ export class SessionList {
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="#FFFFFF">
+    android:background="#CC1E1E1E">
 
     <!-- Top Toolbar -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="56dp"
+        android:layout_height="44dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:background="#2196F3"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp">
+        android:background="#DD2A2A2A"
+        android:paddingStart="12dp"
+        android:paddingEnd="8dp">
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="会话列表"
-            android:textSize="18sp"
-            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textColor="#80CBC4"
             android:textStyle="bold"/>
 
-        <ImageButton
+        <Button
             android:id="@+id/btn_new_session"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="新建会话"/>
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:text="＋"
+            android:textSize="18sp"
+            android:textColor="#EAEAEA"
+            android:background="#00000000"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
 
-        <ImageButton
+        <Button
             android:id="@+id/btn_close"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:layout_marginStart="8dp"
-            android:contentDescription="关闭"/>
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:text="✕"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
+            android:background="#00000000"
+            android:layout_marginStart="4dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
     </LinearLayout>
 
     <!-- Session List ScrollView -->
@@ -143,10 +153,7 @@ export class SessionList {
             android:id="@+id/session_list_container"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:divider="#E0E0E0"
-            android:showDividers="middle"
-            android:dividerHeight="1dp"/>
+            android:orientation="vertical"/>
     </ScrollView>
 
     <!-- Empty State (initially hidden) -->
@@ -164,13 +171,15 @@ export class SessionList {
             android:layout_height="wrap_content"
             android:text="暂无会话"
             android:textSize="16sp"
-            android:textColor="#666666"/>
+            android:textColor="#AAAAAA"/>
 
         <Button
             android:id="@+id/btn_create_first"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="创建新会话"
+            android:textColor="#80CBC4"
+            android:background="#00000000"
             android:layout_marginTop="16dp"/>
     </LinearLayout>
 </LinearLayout>`;

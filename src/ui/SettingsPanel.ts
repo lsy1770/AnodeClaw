@@ -126,41 +126,51 @@ export class SettingsPanel {
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="#FFFFFF">
+    android:background="#CC1E1E1E">
 
     <!-- Top Toolbar -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="56dp"
+        android:layout_height="44dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:background="#2196F3"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp">
+        android:background="#DD2A2A2A"
+        android:paddingStart="12dp"
+        android:paddingEnd="8dp">
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="设置"
-            android:textSize="18sp"
-            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textColor="#80CBC4"
             android:textStyle="bold"/>
 
-        <ImageButton
+        <Button
             android:id="@+id/btn_save"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="保存"/>
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:text="💾"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
+            android:background="#00000000"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
 
-        <ImageButton
+        <Button
             android:id="@+id/btn_close"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:layout_marginStart="8dp"
-            android:contentDescription="关闭"/>
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:text="✕"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
+            android:background="#00000000"
+            android:layout_marginStart="4dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
     </LinearLayout>
 
     <!-- Settings ScrollView -->
@@ -181,7 +191,7 @@ export class SettingsPanel {
                 android:text="模型设置"
                 android:textSize="16sp"
                 android:textStyle="bold"
-                android:textColor="#000000"
+                android:textColor="#80CBC4"
                 android:layout_marginBottom="8dp"/>
 
             <!-- Provider Selection -->
@@ -190,7 +200,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="AI 提供商"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="8dp"/>
 
             <Spinner
@@ -205,7 +215,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="模型"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="16dp"/>
 
             <EditText
@@ -213,7 +223,11 @@ export class SettingsPanel {
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:hint="例如: claude-sonnet-4-5"
+                android:textColor="#EAEAEA"
+                android:textColorHint="#888888"
                 android:inputType="text"
+                android:background="#CC303030"
+                android:padding="12dp"
                 android:layout_marginTop="4dp"/>
 
             <!-- API Key -->
@@ -222,7 +236,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="API Key"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="16dp"/>
 
             <EditText
@@ -230,7 +244,11 @@ export class SettingsPanel {
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:hint="输入 API Key"
+                android:textColor="#EAEAEA"
+                android:textColorHint="#888888"
                 android:inputType="textPassword"
+                android:background="#CC303030"
+                android:padding="12dp"
                 android:layout_marginTop="4dp"/>
 
             <!-- Max Tokens -->
@@ -239,7 +257,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="最大 Token 数"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="16dp"/>
 
             <EditText
@@ -247,14 +265,18 @@ export class SettingsPanel {
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:hint="默认: 8192"
+                android:textColor="#EAEAEA"
+                android:textColorHint="#888888"
                 android:inputType="number"
+                android:background="#CC303030"
+                android:padding="12dp"
                 android:layout_marginTop="4dp"/>
 
             <!-- Divider -->
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#E0E0E0"
+                android:background="#444444"
                 android:layout_marginTop="24dp"
                 android:layout_marginBottom="16dp"/>
 
@@ -265,7 +287,7 @@ export class SettingsPanel {
                 android:text="界面设置"
                 android:textSize="16sp"
                 android:textStyle="bold"
-                android:textColor="#000000"
+                android:textColor="#80CBC4"
                 android:layout_marginBottom="8dp"/>
 
             <!-- Theme Selection -->
@@ -274,7 +296,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="主题"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="8dp"/>
 
             <Spinner
@@ -287,7 +309,7 @@ export class SettingsPanel {
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#E0E0E0"
+                android:background="#444444"
                 android:layout_marginTop="24dp"
                 android:layout_marginBottom="16dp"/>
 
@@ -298,7 +320,7 @@ export class SettingsPanel {
                 android:text="工具管理"
                 android:textSize="16sp"
                 android:textStyle="bold"
-                android:textColor="#000000"
+                android:textColor="#80CBC4"
                 android:layout_marginBottom="8dp"/>
 
             <!-- Tool List Container -->
@@ -313,7 +335,7 @@ export class SettingsPanel {
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#E0E0E0"
+                android:background="#444444"
                 android:layout_marginTop="24dp"
                 android:layout_marginBottom="16dp"/>
 
@@ -324,7 +346,7 @@ export class SettingsPanel {
                 android:text="关于"
                 android:textSize="16sp"
                 android:textStyle="bold"
-                android:textColor="#000000"
+                android:textColor="#80CBC4"
                 android:layout_marginBottom="8dp"/>
 
             <TextView
@@ -332,7 +354,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="Anode ClawdBot v0.2.0"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="8dp"/>
 
             <TextView
@@ -340,7 +362,7 @@ export class SettingsPanel {
                 android:layout_height="wrap_content"
                 android:text="Android AI Agent System"
                 android:textSize="14sp"
-                android:textColor="#666666"
+                android:textColor="#AAAAAA"
                 android:layout_marginTop="4dp"/>
         </LinearLayout>
     </ScrollView>
@@ -439,7 +461,7 @@ export class SettingsPanel {
             android:layout_height="wrap_content"
             android:text="${tool.name}"
             android:textSize="14sp"
-            android:textColor="#000000"
+            android:textColor="#EAEAEA"
             android:textStyle="bold"/>
 
         <TextView
@@ -447,7 +469,7 @@ export class SettingsPanel {
             android:layout_height="wrap_content"
             android:text="${tool.description}"
             android:textSize="12sp"
-            android:textColor="#666666"
+            android:textColor="#AAAAAA"
             android:layout_marginTop="4dp"/>
     </LinearLayout>
 

@@ -39,6 +39,7 @@ export const AgentConfigSchema = z.object({
 export const UIConfigSchema = z.object({
     theme: z.enum(['light', 'dark', 'auto']).default('auto'),
     floatingWindow: z.object({
+        enabled: z.boolean().default(true), // 是否启用悬浮窗功能
         width: z.number().int().positive().default(700),
         height: z.number().int().positive().default(1000),
         x: z.number().int().default(50),

@@ -162,17 +162,17 @@ export class ChatWindow {
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="#FFFFFF">
+    android:background="#CC1E1E1E">
 
     <!-- Top Toolbar -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="56dp"
+        android:layout_height="44dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:background="#2196F3"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp">
+        android:background="#DD2A2A2A"
+        android:paddingStart="12dp"
+        android:paddingEnd="8dp">
 
         <TextView
             android:id="@+id/title"
@@ -180,16 +180,17 @@ export class ChatWindow {
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="Anode ClawdBot"
-            android:textSize="18sp"
-            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textColor="#80CBC4"
             android:textStyle="bold"/>
 
         <Button
             android:id="@+id/btn_sessions"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
             android:text="📋"
-            android:textSize="18sp"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
             android:background="#00000000"
             android:minWidth="0dp"
             android:minHeight="0dp"
@@ -197,25 +198,26 @@ export class ChatWindow {
 
         <Button
             android:id="@+id/btn_settings"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
             android:text="⚙️"
-            android:textSize="18sp"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
             android:background="#00000000"
-            android:layout_marginStart="4dp"
+            android:layout_marginStart="2dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
             android:padding="0dp"/>
 
         <Button
             android:id="@+id/btn_close"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
             android:text="✕"
-            android:textSize="18sp"
-            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
             android:background="#00000000"
-            android:layout_marginStart="4dp"
+            android:layout_marginStart="2dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
             android:padding="0dp"/>
@@ -227,7 +229,8 @@ export class ChatWindow {
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:padding="16dp"
+        android:padding="12dp"
+        android:background="#00000000"
         android:scrollbars="vertical">
 
         <LinearLayout
@@ -243,7 +246,7 @@ export class ChatWindow {
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:padding="8dp"
-        android:background="#F5F5F5"
+        android:background="#CC303030"
         android:gravity="center_vertical">
 
         <EditText
@@ -252,15 +255,20 @@ export class ChatWindow {
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:hint="输入消息..."
+            android:textColor="#EAEAEA"
+            android:textColorHint="#888888"
             android:padding="12dp"
             android:maxLines="4"
-            android:inputType="textMultiLine"/>
+            android:inputType="textMultiLine"
+            android:background="#CC3E3E3E"/>
 
         <Button
             android:id="@+id/btn_send"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="发送"
+            android:textColor="#80CBC4"
+            android:background="#00000000"
             android:layout_marginStart="8dp"/>
     </LinearLayout>
 </LinearLayout>`;

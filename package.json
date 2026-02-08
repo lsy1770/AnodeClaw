@@ -8,7 +8,7 @@
     "anode-clawdbot": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && xcopy assets\\prompts dist\\assets\\prompts\\ /E /I /Y",
     "clean": "rm -rf dist",
     "rebuild": "npm run clean && npm run build",
     "test": "vitest",

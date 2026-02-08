@@ -739,7 +739,7 @@ export class ControlPanel {
             const autoOpenChatView = floatingWindow.findView('check_auto_open_chat');
             if (autoOpenChatView && config.ui) {
                 if (!config.ui.floatingWindow) {
-                    config.ui.floatingWindow = { x: 50, y: 100, width: 700, height: 1000, autoOpen: false };
+                    config.ui.floatingWindow = { enabled: true, x: 50, y: 100, width: 700, height: 1000, autoOpen: false };
                 }
                 config.ui.floatingWindow.autoOpen = floatingWindow.isChecked(autoOpenChatView);
             }

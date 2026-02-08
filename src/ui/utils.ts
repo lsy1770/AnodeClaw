@@ -77,7 +77,7 @@ export function createMediaCard(attachment: {
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:background="#E8EAF6"
+        android:background="#CC3E3E3E"
         android:padding="8dp"
         android:layout_marginTop="4dp"
         android:gravity="center_vertical">
@@ -100,7 +100,7 @@ export function createMediaCard(attachment: {
                 android:layout_height="wrap_content"
                 android:text="${displayName}"
                 android:textSize="13sp"
-                android:textColor="#1A237E"
+                android:textColor="#EAEAEA"
                 android:textStyle="bold"
                 android:maxLines="1"
                 android:ellipsize="middle"/>
@@ -110,7 +110,7 @@ export function createMediaCard(attachment: {
                 android:layout_height="wrap_content"
                 android:text="${displayPath}"
                 android:textSize="11sp"
-                android:textColor="#5C6BC0"
+                android:textColor="#AAAAAA"
                 android:maxLines="1"
                 android:ellipsize="middle"/>
         </LinearLayout>
@@ -126,9 +126,9 @@ export function createMessageBubble(
   attachments?: Array<{ type: string; localPath: string; filename?: string }>
 ): string {
   const isUser = message.role === 'user';
-  const backgroundColor = isUser ? '#E3F2FD' : '#F5F5F5';
+  const backgroundColor = isUser ? '#CC37474F' : '#CC2E2E2E';
   const alignment = isUser ? 'end' : 'start';
-  const textColor = '#000000';
+  const textColor = '#EAEAEA';
 
   let mediaCards = '';
   if (attachments && attachments.length > 0) {
@@ -175,9 +175,9 @@ export function createThinkingIndicator(indicatorId: string): string {
         android:layout_height="wrap_content"
         android:text="AI 正在思考..."
         android:textSize="14sp"
-        android:textColor="#666666"
+        android:textColor="#999999"
         android:padding="12dp"
-        android:background="#F5F5F5"
+        android:background="#CC2E2E2E"
         android:layout_gravity="start"/>
 </LinearLayout>`;
 }
@@ -201,7 +201,6 @@ export function createSessionListItem(session: {
     android:layout_height="wrap_content"
     android:orientation="vertical"
     android:padding="16dp"
-    android:background="?attr/selectableItemBackground"
     android:clickable="true">
 
     <LinearLayout
@@ -215,7 +214,7 @@ export function createSessionListItem(session: {
             android:layout_weight="1"
             android:text="${escapeXml(session.title)}"
             android:textSize="16sp"
-            android:textColor="#000000"
+            android:textColor="#EAEAEA"
             android:textStyle="bold"/>
 
         <TextView
@@ -223,7 +222,7 @@ export function createSessionListItem(session: {
             android:layout_height="wrap_content"
             android:text="${timeStr}"
             android:textSize="12sp"
-            android:textColor="#666666"/>
+            android:textColor="#AAAAAA"/>
     </LinearLayout>
 
     <TextView
@@ -231,9 +230,15 @@ export function createSessionListItem(session: {
         android:layout_height="wrap_content"
         android:text="${preview}"
         android:textSize="14sp"
-        android:textColor="#666666"
+        android:textColor="#AAAAAA"
         android:layout_marginTop="4dp"
         android:maxLines="2"
         android:ellipsize="end"/>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#444444"
+        android:layout_marginTop="16dp"/>
 </LinearLayout>`;
 }

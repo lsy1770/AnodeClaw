@@ -41,19 +41,47 @@
 
 ## Quick Start
 
+### Step 1: Install dependencies (on PC)
+
 ```bash
-# Install dependencies
 npm install
-
-# Build
-npm run build
-
-# Set API key
-export ANTHROPIC_API_KEY=your-key
-
-# Run
-node dist/main.js
 ```
+
+### Step 2: Build (on PC)
+
+```bash
+npm run build
+```
+
+This generates the `dist` directory containing compiled JS files and `assets/prompts`.
+
+### Step 3: Copy to device
+
+Copy the entire project folder to the ACS project path on your Android device, e.g.:
+
+```
+/sdcard/ACS/projects/anode-clawdbot/
+```
+
+### Step 4: Open terminal on device
+
+Open the ACS terminal and cd into the project path:
+
+```bash
+cd /sdcard/ACS/projects/anode-clawdbot
+```
+
+### Step 5: Install runtime dependencies (on device)
+
+```bash
+npm install --no-scripts
+```
+
+> `--no-scripts` skips postinstall scripts to avoid build tool errors on the device.
+
+### Step 6: Run
+
+Open `dist/start-ui.js` in the ACS editor and click the Run button.
 
 ## Configuration
 

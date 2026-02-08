@@ -12,6 +12,7 @@ import { ChatWindow } from './ChatWindow.js';
 import { AgentManager } from '../core/AgentManager.js';
 import { NotificationManager } from './NotificationManager.js';
 import { SessionList } from './SessionList.js';
+import { SettingsPanel } from './SettingsPanel.js';
 
 // 声明全局 ui API
 declare const ui: {
@@ -61,6 +62,7 @@ const VIEW_IDS = [
   'check_telegram_enabled', 'check_qq_enabled', 'check_wechat_enabled',
   'check_discord_enabled', 'check_feishu_enabled', 'check_dingtalk_enabled',
   'check_auto_save', 'check_compression', 'check_notifications',
+  'check_enable_floating',
   // Social config fields
   'edit_telegram_token',
   'edit_qq_appid', 'edit_qq_token',
@@ -76,6 +78,7 @@ const CHECKBOX_IDS: ViewId[] = [
   'check_telegram_enabled', 'check_qq_enabled', 'check_wechat_enabled',
   'check_discord_enabled', 'check_feishu_enabled', 'check_dingtalk_enabled',
   'check_auto_save', 'check_compression', 'check_notifications',
+  'check_enable_floating',
 ];
 
 /** Radio button IDs */
@@ -87,6 +90,7 @@ export class ControlPanel {
   private chatWindow: ChatWindow | null = null;
   private notificationManager: NotificationManager;
   private sessionList: SessionList | null = null;
+  private settingsPanel: SettingsPanel | null = null;
   private isChatRunning = false;
   private currentTab: 'ai' | 'channels' | 'advanced' = 'ai';
 
@@ -141,6 +145,8 @@ export class ControlPanel {
     }
     this.sessionList?.close();
     this.sessionList = null;
+    this.settingsPanel?.close();
+    this.settingsPanel = null;
     this.notificationManager.shutdown().catch(() => {});
     if (this.agentManager) {
       this.agentManager.shutdown().catch(() => {});
@@ -327,6 +333,7 @@ export class ControlPanel {
       this.setCheckboxState('check_auto_save', config.agent.autoSave !== false);
       this.setCheckboxState('check_compression', config.agent.compressionEnabled !== false);
       this.setCheckboxState('check_notifications', config.ui?.notifications?.enabled !== false);
+      this.setCheckboxState('check_enable_floating', config.ui?.floatingWindow?.enabled !== false);
 
       // Social platforms
       if (config.social) {
@@ -392,10 +399,13 @@ export class ControlPanel {
       config.agent.autoSave = this.getCheckboxState('check_auto_save');
       config.agent.compressionEnabled = this.getCheckboxState('check_compression');
       if (!config.ui) {
-        config.ui = { theme: 'auto', floatingWindow: { width: 700, height: 1000, x: 50, y: 100, autoOpen: false }, notifications: { enabled: true, showProgress: true } };
+        config.ui = { theme: 'auto', floatingWindow: { enabled: true, width: 700, height: 1000, x: 50, y: 100, autoOpen: false }, notifications: { enabled: true, showProgress: true } };
       }
       if (config.ui.notifications) {
         config.ui.notifications.enabled = this.getCheckboxState('check_notifications');
+      }
+      if (config.ui.floatingWindow) {
+        config.ui.floatingWindow.enabled = this.getCheckboxState('check_enable_floating');
       }
 
       // Social - always save enabled state, even if token is empty
@@ -461,6 +471,12 @@ export class ControlPanel {
       // Save UI changes to config before starting chat
       await this.handleSaveConfig();
 
+      // Check if floating window is enabled
+      if (!this.getCheckboxState('check_enable_floating')) {
+        globalApi.toast('悬浮窗未启用，请在高级设置中勾选"启用悬浮窗"', "long");
+        return;
+      }
+
       const config = this.configManager.get();
       logger.info('[ControlPanel] Starting chat with provider:', config.model.provider);
       this.agentManager = new AgentManager(config);
@@ -472,7 +488,7 @@ export class ControlPanel {
       this.sessionList = new SessionList(this.agentManager);
       this.sessionList.onSessionSelect((sessionId) => {
         logger.info(`[ControlPanel] Session selected: ${sessionId}`);
-        // Could switch ChatWindow to this session in the future
+        this.chatWindow?.switchSession(sessionId);
       });
       this.sessionList.onNewSession(async () => {
         if (this.agentManager) {
@@ -483,6 +499,17 @@ export class ControlPanel {
       });
       this.sessionList.onDeleteSession((sessionId) => {
         logger.info(`[ControlPanel] Session deleted: ${sessionId}`);
+      });
+
+      // Initialize SettingsPanel
+      this.settingsPanel = new SettingsPanel(this.agentManager, config);
+
+      // Wire chatWindow toolbar callbacks
+      this.chatWindow.onSessionChange((_sessionId: string) => {
+        this.sessionList?.show();
+      });
+      this.chatWindow.onSettings(() => {
+        this.settingsPanel?.show();
       });
 
       // Show notification if enabled
@@ -527,6 +554,8 @@ export class ControlPanel {
       this.chatWindow = null;
       this.sessionList?.close();
       this.sessionList = null;
+      this.settingsPanel?.close();
+      this.settingsPanel = null;
       this.notificationManager.hide().catch(() => {});
       if (this.agentManager) {
         this.agentManager.shutdown().catch(err => {
@@ -868,6 +897,7 @@ export class ControlPanel {
     <CheckBox android:id="@+id/check_auto_save" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="自动保存会话" android:layout_marginTop="16dp" android:checked="true"/>
     <CheckBox android:id="@+id/check_compression" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="启用上下文压缩" android:layout_marginTop="8dp" android:checked="true"/>
     <CheckBox android:id="@+id/check_notifications" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="启用通知" android:layout_marginTop="8dp" android:checked="true"/>
+    <CheckBox android:id="@+id/check_enable_floating" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="启用悬浮窗" android:layout_marginTop="8dp" android:checked="true"/>
 </LinearLayout>`;
   }
 }
