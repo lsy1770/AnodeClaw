@@ -88,11 +88,23 @@ export class MemorySystem {
     }
     /**
      * Create and save a memory entry
+     * High-importance memories are also appended to MEMORY.md for persistence
      */
     async createMemory(title, content, options) {
         const entry = this.memoryFiles.createEntry(title, content, options);
         await this.memoryFiles.save(entry);
+        // Auto-append high-importance memories to MEMORY.md
+        if (options?.importance === 'high') {
+            await this.appendToMainMemory(title, content);
+        }
         return entry;
+    }
+    /**
+     * Append important information to MEMORY.md main memory file
+     * Called automatically for high-importance memories
+     */
+    async appendToMainMemory(title, content) {
+        await this.memoryFiles.appendToMainMemory(title, content);
     }
     /**
      * Load a memory entry
@@ -163,5 +175,20 @@ export class MemorySystem {
             await this.memoryFiles.delete(entry.id);
         }
         logger.info('[MemorySystem] Cleared all memories');
+    }
+    /**
+     * Rebuild the memory index
+     * Call this after adding new memory files or when search results seem stale
+     */
+    async rebuildIndex() {
+        await this.memoryFiles.buildIndex(true);
+        logger.info('[MemorySystem] Memory index rebuilt');
+    }
+    /**
+     * Invalidate the memory index
+     * The index will be rebuilt on next search
+     */
+    invalidateIndex() {
+        this.memoryFiles.invalidateIndex();
     }
 }

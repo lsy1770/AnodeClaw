@@ -13,6 +13,7 @@ import { Session } from './Session.js';
 import { FileSessionStorage } from './FileSessionStorage.js';
 import { ModelAPI, ModelAPIError } from './ModelAPI.js';
 import type { Config } from '../config/schema.js';
+import type { MediaAttachment } from './types.js';
 import { generateSessionId } from '../utils/id.js';
 import { logger } from '../utils/logger.js';
 import { ToolRegistry, ToolExecutor, builtinTools, setMemorySystem, setSubAgentCoordinator } from '../tools/index.js';
@@ -33,7 +34,7 @@ import { PromptBuilder } from './prompts/PromptBuilder.js';
 import { SystemPromptBuilder } from './prompts/SystemPromptBuilder.js';
 import type { PromptConfig, PromptVariables, SystemPromptParams, RuntimeInfo } from './prompts/types.js';
 // Social imports removed (duplicates)
-import type { SocialMessage, OutgoingMessage, PlatformConfig } from '../social/types.js';
+import type { SocialMessage, SocialAttachment, OutgoingMessage, PlatformConfig } from '../social/types.js';
 import { MemorySystem } from './memory/MemorySystem.js';
 import type { SessionLogEntry } from './memory/types.js';
 import { DailyLogManager } from './memory/DailyLogManager.js';
@@ -101,6 +102,7 @@ export interface AgentResponse {
     inputTokens: number;
     outputTokens: number;
   };
+  attachments?: MediaAttachment[];
 }
 
 /**
@@ -310,14 +312,39 @@ export class AgentManager {
       () => this.getActiveSessions(),
     );
 
+    // Register AI insight generator for proactive behavior
+    this.proactiveBehavior.setAIInsightGenerator(async (context: string) => {
+      try {
+        const response = await this.modelAPI.createMessage({
+          model: this.config.model.model,
+          messages: [
+            {
+              id: 'proactive-insight',
+              role: 'user',
+              content: context,
+              timestamp: Date.now(),
+              parentId: null,
+              children: [],
+            },
+          ],
+          maxTokens: 200,
+          temperature: 0.7,
+          systemPrompt: `You are an AI assistant analyzing user activity patterns.
+Based on the activity summary provided, generate ONE brief, actionable insight or suggestion.
+Focus on being helpful - suggest optimizations, remind about pending tasks, or offer assistance.
+Keep your response under 200 characters. Be friendly and concise.
+If there's nothing noteworthy, respond with an empty string.`,
+        });
+        return response.content;
+      } catch (err) {
+        logger.debug('[Proactive] AI insight request failed:', err);
+        return null;
+      }
+    });
+
     // Initialize Social Manager
     this.socialManager = new SocialAdapterManager();
     this.registerSocialAdapters();
-    if (config.social) {
-      this.socialManager.initialize({
-        platforms: config.social as any
-      }).catch(err => logger.error('[AgentManager] SocialManager init failed:', err));
-    }
 
     this.proactiveBehavior.on('suggestions', async (suggestions: ProactiveSuggestion[]) => {
       for (const s of suggestions) {
@@ -806,6 +833,7 @@ export class AgentManager {
       const maxIterations = (this.config.agent as any).maxToolIterations || 20;
       let iteration = 0;
       let finalResponse: AgentResponse | null = null;
+      const accumulatedAttachments: MediaAttachment[] = [];
 
       while (iteration < maxIterations) {
         iteration++;
@@ -882,7 +910,7 @@ export class AgentManager {
         });
 
         // Process response
-        const response = await this.processResponse(session, modelResponse);
+        const response = await this.processResponse(session, modelResponse, accumulatedAttachments);
 
         // If it's a text response, we're done
         if (response.type === 'text') {
@@ -973,15 +1001,22 @@ export class AgentManager {
           // Add tool results to session as individual 'tool' messages
           for (let i = 0; i < toolResults.length; i++) {
             const toolCall = [...approvedToolCalls, ...deniedToolCalls][i];
+            const toolResult = toolResults[i];
+
+            // Accumulate attachments from tool results
+            if ('attachments' in toolResult && toolResult.attachments) {
+              accumulatedAttachments.push(...(toolResult as any).attachments);
+            }
+
             session.addMessage({
               role: 'tool',
-              content: typeof toolResults[i].output === 'string'
-                ? toolResults[i].output
-                : JSON.stringify(toolResults[i].output ?? ''),
+              content: typeof toolResult.output === 'string'
+                ? toolResult.output
+                : JSON.stringify(toolResult.output ?? ''),
               metadata: {
                 tool_call_id: toolCall.id,
                 tool_name: toolCall.name,
-                is_error: !toolResults[i].success,
+                is_error: !toolResult.success,
               },
             });
           }
@@ -1129,6 +1164,7 @@ export class AgentManager {
       const maxIterations = (this.config.agent as any).maxToolIterations || 20;
       let iteration = 0;
       let finalResponse: AgentResponse | null = null;
+      const accumulatedAttachments: MediaAttachment[] = [];
 
       while (iteration < maxIterations) {
         iteration++;
@@ -1332,15 +1368,22 @@ export class AgentManager {
           // Add tool results
           for (let i = 0; i < toolResults.length; i++) {
             const toolCall = [...approvedToolCalls, ...deniedToolCalls][i];
+            const toolResult = toolResults[i];
+
+            // Accumulate attachments from tool results
+            if ('attachments' in toolResult && toolResult.attachments) {
+              accumulatedAttachments.push(...(toolResult as any).attachments);
+            }
+
             session.addMessage({
               role: 'tool',
-              content: typeof toolResults[i].output === 'string'
-                ? toolResults[i].output
-                : JSON.stringify(toolResults[i].output ?? ''),
+              content: typeof toolResult.output === 'string'
+                ? toolResult.output
+                : JSON.stringify(toolResult.output ?? ''),
               metadata: {
                 tool_call_id: toolCall.id,
                 tool_name: toolCall.name,
-                is_error: !toolResults[i].success,
+                is_error: !toolResult.success,
               },
             });
           }
@@ -1356,6 +1399,7 @@ export class AgentManager {
             metadata: {
               model: session.model,
               tokens: usage ? usage.inputTokens + usage.outputTokens : undefined,
+              attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
             },
           });
 
@@ -1363,6 +1407,7 @@ export class AgentManager {
             type: 'text',
             content: accumulatedText,
             usage,
+            attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
           };
           break;
         }
@@ -1421,7 +1466,7 @@ export class AgentManager {
    * @param modelResponse - Response from model API
    * @returns Agent response
    */
-  private async processResponse(session: Session, modelResponse: any): Promise<AgentResponse> {
+  private async processResponse(session: Session, modelResponse: any, attachments?: MediaAttachment[]): Promise<AgentResponse> {
     if (modelResponse.type === 'text') {
       // Simple text response
       session.addMessage({
@@ -1430,6 +1475,7 @@ export class AgentManager {
         metadata: {
           model: session.model,
           tokens: modelResponse.usage?.inputTokens + modelResponse.usage?.outputTokens,
+          attachments: attachments?.length ? attachments : undefined,
         },
       });
 
@@ -1437,6 +1483,7 @@ export class AgentManager {
         type: 'text',
         content: modelResponse.content,
         usage: modelResponse.usage,
+        attachments: attachments?.length ? attachments : undefined,
       };
     }
 
@@ -1795,6 +1842,20 @@ export class AgentManager {
 
     logger.info(`[Social] Initializing ${enabledCount} enabled platform(s)...`);
 
+    // Register configured default broadcast channels
+    const broadcastConfigs: [string, any][] = [
+      ['telegram', socialConfig.telegram],
+      ['qq', socialConfig.qq],
+      ['discord', socialConfig.discord],
+      ['feishu', socialConfig.feishu],
+      ['dingtalk', socialConfig.dingtalk],
+    ];
+    for (const [name, cfg] of broadcastConfigs) {
+      if (cfg?.broadcastChatId) {
+        this.socialManager.setDefaultChannel(name, cfg.broadcastChatId);
+      }
+    }
+
     // Initialize asynchronously — don't block constructor
     this.socialManager.initialize({
       platforms,
@@ -1806,6 +1867,19 @@ export class AgentManager {
     }).catch(err => {
       logger.error('[Social] Social platform initialization failed:', err);
     });
+  }
+
+  /**
+   * Convert MediaAttachments to SocialAttachments for platform sending
+   */
+  private convertToSocialAttachments(attachments?: MediaAttachment[]): SocialAttachment[] | undefined {
+    if (!attachments?.length) return undefined;
+    return attachments.map(att => ({
+      type: att.type,
+      url: att.localPath,
+      filename: att.filename,
+      mimeType: att.mimeType,
+    }));
   }
 
   /**
@@ -1893,6 +1967,16 @@ export class AgentManager {
           // Log completion
           if (response.type === 'text') {
             logger.info(`[Social] Replied (streaming) to ${chatKey}: ${response.content.substring(0, 80)}`);
+
+            // Send attachments as a separate message (text was already streamed via edits)
+            const socialAttachments = this.convertToSocialAttachments(response.attachments);
+            if (socialAttachments?.length) {
+              await this.socialManager.sendMessage(message.platform, {
+                chatId: message.chatId,
+                text: '',
+                attachments: socialAttachments,
+              });
+            }
           }
         } else {
           // Fallback: non-streaming
@@ -1902,6 +1986,7 @@ export class AgentManager {
               chatId: message.chatId,
               text: response.content,
               replyTo: message.messageId,
+              attachments: this.convertToSocialAttachments(response.attachments),
             });
             logger.info(`[Social] Replied to ${chatKey}: ${response.content.substring(0, 80)}`);
           } else if (response.type === 'error') {
@@ -1921,6 +2006,7 @@ export class AgentManager {
             chatId: message.chatId,
             text: response.content,
             replyTo: message.messageId,
+            attachments: this.convertToSocialAttachments(response.attachments),
           });
           logger.info(`[Social] Replied to ${chatKey}: ${response.content.substring(0, 80)}`);
         } else if (response.type === 'error') {

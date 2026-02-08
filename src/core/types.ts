@@ -26,6 +26,16 @@ export interface ToolResult {
 }
 
 /**
+ * Media attachment for tool outputs (images, videos, audio, files)
+ */
+export interface MediaAttachment {
+  type: 'image' | 'video' | 'audio' | 'file';
+  localPath: string;
+  filename?: string;
+  mimeType?: string;
+}
+
+/**
  * Message content types
  */
 export type MessageContent =

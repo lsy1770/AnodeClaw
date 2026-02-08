@@ -46,6 +46,12 @@ export interface ToolResult {
     timestamp?: number;
     [key: string]: any;
   };
+  attachments?: Array<{
+    type: 'image' | 'video' | 'audio' | 'file';
+    localPath: string;
+    filename?: string;
+    mimeType?: string;
+  }>;
 }
 
 /**

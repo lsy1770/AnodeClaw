@@ -227,7 +227,7 @@ export const androidFindTextTool = {
                 nodes = node ? [node] : [];
             }
             else {
-                nodes = await auto.findOne(selector);
+                nodes = await auto.findAll(selector);
             }
             return {
                 success: true,
@@ -424,6 +424,11 @@ export const androidScreenshotTool = {
                         quality,
                         message: 'Screenshot saved successfully',
                     },
+                    attachments: [{
+                            type: 'image',
+                            localPath: path,
+                            mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+                        }],
                 };
             }
             else {

@@ -49,16 +49,91 @@ export function generateViewId(): string {
 }
 
 /**
+ * Get emoji icon for media type
+ */
+function getMediaIcon(type: string): string {
+  switch (type) {
+    case 'image': return '🖼';
+    case 'video': return '🎬';
+    case 'audio': return '🎵';
+    default: return '📎';
+  }
+}
+
+/**
+ * Create media card XML for an attachment
+ */
+export function createMediaCard(attachment: {
+  type: string;
+  localPath: string;
+  filename?: string;
+}): string {
+  const icon = getMediaIcon(attachment.type);
+  const displayName = escapeXml(attachment.filename || attachment.localPath.split('/').pop() || 'file');
+  const displayPath = escapeXml(attachment.localPath);
+
+  return `
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="#E8EAF6"
+        android:padding="8dp"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="${icon}"
+            android:textSize="18sp"
+            android:layout_marginEnd="8dp"/>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="${displayName}"
+                android:textSize="13sp"
+                android:textColor="#1A237E"
+                android:textStyle="bold"
+                android:maxLines="1"
+                android:ellipsize="middle"/>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="${displayPath}"
+                android:textSize="11sp"
+                android:textColor="#5C6BC0"
+                android:maxLines="1"
+                android:ellipsize="middle"/>
+        </LinearLayout>
+    </LinearLayout>`;
+}
+
+/**
  * Create message bubble XML
  */
 export function createMessageBubble(
   message: { role: 'user' | 'assistant'; content: string },
-  messageId: string
+  messageId: string,
+  attachments?: Array<{ type: string; localPath: string; filename?: string }>
 ): string {
   const isUser = message.role === 'user';
   const backgroundColor = isUser ? '#E3F2FD' : '#F5F5F5';
   const alignment = isUser ? 'end' : 'start';
   const textColor = '#000000';
+
+  let mediaCards = '';
+  if (attachments && attachments.length > 0) {
+    mediaCards = attachments.map(att => createMediaCard(att)).join('');
+  }
 
   return `
 <LinearLayout
@@ -78,7 +153,7 @@ export function createMessageBubble(
         android:padding="12dp"
         android:background="${backgroundColor}"
         android:maxWidth="500dp"
-        android:layout_gravity="${alignment}"/>
+        android:layout_gravity="${alignment}"/>${mediaCards}
 </LinearLayout>`;
 }
 

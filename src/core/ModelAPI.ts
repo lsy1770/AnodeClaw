@@ -118,16 +118,41 @@ export class ModelAPI {
   private anthropic?: Anthropic;
   private openai?: OpenAI;
   private provider: 'anthropic' | 'openai' | 'gemini';
+  private configuredBaseURL?: string;
+  private apiKey: string;
+  private useNativeHttp: boolean = false; // Use native HTTP instead of SDK
 
   constructor(provider: 'anthropic' | 'openai' | 'gemini', apiKey: string, baseURL?: string) {
     this.provider = provider;
+    this.configuredBaseURL = baseURL;
+    this.apiKey = apiKey;
 
-    if (provider === 'anthropic') {
+    // Use native HTTP for custom baseURL to avoid SDK path issues
+    if (provider === 'anthropic' && baseURL) {
+      this.useNativeHttp = true;
+      const initInfo = {
+        provider,
+        baseURL,
+        apiKeyPrefix: apiKey ? `${apiKey.substring(0, 8)}...` : '(missing)',
+        mode: 'native HTTP (bypassing SDK)',
+      };
+      console.log('[ModelAPI] Initializing Anthropic with native HTTP:', JSON.stringify(initInfo, null, 2));
+      logger.info('[ModelAPI] Initializing Anthropic with native HTTP', initInfo);
+    } else if (provider === 'anthropic') {
+      const initInfo = {
+        provider,
+        baseURL: '(default: https://api.anthropic.com)',
+        apiKeyPrefix: apiKey ? `${apiKey.substring(0, 8)}...` : '(missing)',
+        mode: 'SDK',
+      };
+      console.log('[ModelAPI] Initializing Anthropic client:', JSON.stringify(initInfo, null, 2));
+      logger.info('[ModelAPI] Initializing Anthropic client', initInfo);
+
       this.anthropic = new Anthropic({
         apiKey,
         baseURL,
       });
-      logger.info('ModelAPI initialized with Anthropic provider');
+      logger.info('[ModelAPI] Anthropic client created successfully');
     } else if (provider === 'openai') {
       this.openai = new OpenAI({
         apiKey,
@@ -135,7 +160,6 @@ export class ModelAPI {
       });
       logger.info('ModelAPI initialized with OpenAI provider', { baseURL: baseURL || 'default' });
     } else if (provider === 'gemini') {
-      // Gemini via OpenAI-compatible API
       this.openai = new OpenAI({
         apiKey,
         baseURL: baseURL || 'https://generativelanguage.googleapis.com/v1beta/openai/',
@@ -155,6 +179,9 @@ export class ModelAPI {
    */
   async createMessage(params: ModelRequest): Promise<ModelResponse> {
     if (this.provider === 'anthropic') {
+      if (this.useNativeHttp) {
+        return this.createAnthropicMessageNative(params);
+      }
       return this.createAnthropicMessage(params);
     } else if (this.provider === 'openai' || this.provider === 'gemini') {
       return this.createOpenAIMessage(params);
@@ -175,7 +202,11 @@ export class ModelAPI {
     streamingHandler?: StreamingHandler
   ): AsyncGenerator<ModelStreamChunk, ModelResponse, undefined> {
     if (this.provider === 'anthropic') {
-      yield* this.createAnthropicMessageStream(params, streamingHandler);
+      if (this.useNativeHttp) {
+        yield* this.createAnthropicMessageStreamNative(params, streamingHandler);
+      } else {
+        yield* this.createAnthropicMessageStream(params, streamingHandler);
+      }
       return this.getStreamFinalResponse();
     } else if (this.provider === 'openai' || this.provider === 'gemini') {
       yield* this.createOpenAIMessageStream(params, streamingHandler);
@@ -238,10 +269,26 @@ export class ModelAPI {
     }
 
     try {
-      logger.debug(`Sending request to Anthropic (model: ${params.model})`);
-
       // Convert messages to Anthropic format
       const messages = this.convertMessagesToAnthropicFormat(params.messages);
+
+      // Log full request details
+      const requestPayload = {
+        model: params.model,
+        max_tokens: params.maxTokens,
+        temperature: params.temperature,
+        system: params.systemPrompt ? `${params.systemPrompt.substring(0, 100)}...` : undefined,
+        messages: messages.map((m: any) => ({
+          role: m.role,
+          contentPreview: typeof m.content === 'string'
+            ? m.content.substring(0, 100)
+            : JSON.stringify(m.content).substring(0, 100),
+        })),
+        toolsCount: params.tools?.length || 0,
+      };
+
+      logger.info('[ModelAPI] Sending request to Anthropic API', requestPayload);
+      logger.debug('[ModelAPI] Full messages payload:', JSON.stringify(messages, null, 2));
 
       // Make API request
       const response = await (this.anthropic as any).messages.create({
@@ -253,13 +300,27 @@ export class ModelAPI {
         tools: params.tools,
       });
 
-      logger.info(
-        `Received response from Anthropic (tokens: ${response.usage.input_tokens}/${response.usage.output_tokens})`
-      );
+      logger.info('[ModelAPI] Received response from Anthropic', {
+        inputTokens: response.usage?.input_tokens,
+        outputTokens: response.usage?.output_tokens,
+        stopReason: response.stop_reason,
+        contentBlocks: response.content?.length,
+      });
 
       // Parse and return response
       return this.parseAnthropicResponse(response);
-    } catch (error) {
+    } catch (error: any) {
+      // Enhanced error logging
+      logger.error('[ModelAPI] Anthropic API error occurred', {
+        errorName: error?.name,
+        errorMessage: error?.message,
+        errorStatus: error?.status,
+        errorType: error?.type,
+        errorCode: error?.error?.type || error?.code,
+        errorDetails: error?.error?.message || error?.error,
+        stack: error?.stack?.substring(0, 500),
+        rawError: JSON.stringify(error, Object.getOwnPropertyNames(error), 2).substring(0, 1000),
+      });
       throw this.handleAnthropicError(error);
     }
   }
@@ -607,12 +668,22 @@ export class ModelAPI {
    * Handle Anthropic API errors
    */
   private handleAnthropicError(error: any): ModelAPIError {
+    // Log the full error object for debugging
+    logger.error('[ModelAPI] Handling Anthropic error:', {
+      isAPIError: error instanceof Anthropic.APIError,
+      errorConstructor: error?.constructor?.name,
+      status: error?.status,
+      message: error?.message,
+      headers: error?.headers,
+      error: error?.error,
+    });
+
     if (error instanceof Anthropic.APIError) {
       const statusCode = error.status;
 
       // Rate limit
       if (statusCode === 429) {
-        logger.error('Rate limit exceeded');
+        logger.error('[ModelAPI] Rate limit exceeded (429)');
         return new ModelAPIError(
           'Rate limit exceeded. Please try again later.',
           'RATE_LIMIT',
@@ -622,7 +693,7 @@ export class ModelAPI {
 
       // Authentication
       if (statusCode === 401) {
-        logger.error('Invalid API key');
+        logger.error('[ModelAPI] Invalid API key (401)');
         return new ModelAPIError(
           'Invalid API key. Please check your configuration.',
           'INVALID_API_KEY',
@@ -630,9 +701,22 @@ export class ModelAPI {
         );
       }
 
+      // Not Found - likely baseURL issue
+      if (statusCode === 404) {
+        logger.error('[ModelAPI] Not Found (404) - Check baseURL configuration', {
+          message: error.message,
+          hint: 'The baseURL might be incorrect. SDK appends /v1/messages to baseURL.',
+        });
+        return new ModelAPIError(
+          `Not Found (404): ${error.message}. Check if baseURL is correct - SDK appends /v1/messages to it.`,
+          'NOT_FOUND',
+          404
+        );
+      }
+
       // Invalid request
       if (statusCode === 400) {
-        logger.error(`Invalid request: ${error.message}`);
+        logger.error(`[ModelAPI] Invalid request (400): ${error.message}`);
         return new ModelAPIError(
           `Invalid request: ${error.message}`,
           'INVALID_REQUEST',
@@ -642,7 +726,7 @@ export class ModelAPI {
 
       // Server error
       if (statusCode && statusCode >= 500) {
-        logger.error(`Server error: ${error.message}`);
+        logger.error(`[ModelAPI] Server error (${statusCode}): ${error.message}`);
         return new ModelAPIError(
           `Server error: ${error.message}`,
           'SERVER_ERROR',
@@ -651,7 +735,7 @@ export class ModelAPI {
       }
 
       // Other API errors
-      logger.error(`API error: ${error.message}`);
+      logger.error(`[ModelAPI] API error (${statusCode}): ${error.message}`);
       return new ModelAPIError(
         `API error: ${error.message}`,
         'API_ERROR',
@@ -661,7 +745,10 @@ export class ModelAPI {
 
     // Network or other errors
     if (error instanceof Error) {
-      logger.error(`Network error: ${error.message}`);
+      logger.error(`[ModelAPI] Network/Unknown error: ${error.message}`, {
+        name: error.name,
+        stack: error.stack?.substring(0, 300),
+      });
       return new ModelAPIError(
         `Network error: ${error.message}`,
         'NETWORK_ERROR'
@@ -669,7 +756,7 @@ export class ModelAPI {
     }
 
     // Unknown error
-    logger.error('Unknown error occurred');
+    logger.error('[ModelAPI] Unknown error occurred', { error });
     return new ModelAPIError(
       'An unknown error occurred',
       'UNKNOWN_ERROR'
@@ -722,9 +809,16 @@ export class ModelAPI {
     const messageId = `msg_${Date.now()}`;
 
     try {
-      logger.debug(`Sending streaming request to Anthropic (model: ${params.model})`);
-
       const messages = this.convertMessagesToAnthropicFormat(params.messages);
+
+      // Log streaming request details
+      logger.info('[ModelAPI] Sending streaming request to Anthropic', {
+        model: params.model,
+        maxTokens: params.maxTokens,
+        temperature: params.temperature,
+        messageCount: messages.length,
+        toolsCount: params.tools?.length || 0,
+      });
 
       // Create streaming request
       const stream = await (this.anthropic as any).messages.stream({
@@ -847,9 +941,30 @@ export class ModelAPI {
       }
 
       logger.info(
-        `Streaming completed (tokens: ${this.streamAccumulator.inputTokens}/${this.streamAccumulator.outputTokens})`
+        `[ModelAPI] Streaming completed (tokens: ${this.streamAccumulator.inputTokens}/${this.streamAccumulator.outputTokens})`
       );
-    } catch (error) {
+    } catch (error: any) {
+      // Enhanced error logging for streaming - use console.log for guaranteed visibility
+      const errorDetails = {
+        errorName: error?.name,
+        errorMessage: error?.message,
+        errorStatus: error?.status,
+        errorType: error?.type,
+        errorCode: error?.error?.type || error?.code,
+        errorDetails: error?.error?.message || error?.error,
+        configuredBaseURL: this.configuredBaseURL || '(default)',
+        expectedRequestURL: this.configuredBaseURL
+          ? `${this.configuredBaseURL}/v1/messages`
+          : 'https://api.anthropic.com/v1/messages',
+      };
+
+      console.log('[ModelAPI] ========== ANTHROPIC STREAMING ERROR ==========');
+      console.log('[ModelAPI] Error details:', JSON.stringify(errorDetails, null, 2));
+      console.log('[ModelAPI] Raw error:', error);
+      console.log('[ModelAPI] ================================================');
+
+      logger.error('[ModelAPI] Anthropic streaming error occurred', errorDetails);
+
       streamingHandler?.emitError(
         'STREAM_ERROR',
         error instanceof Error ? error.message : 'Unknown streaming error'
@@ -1037,6 +1152,289 @@ export class ModelAPI {
         error instanceof Error ? error.message : 'Unknown streaming error'
       );
       throw this.handleOpenAIError(error);
+    }
+  }
+
+  // ===== Native HTTP Implementation (bypassing SDK) =====
+
+  /**
+   * Create message using native HTTP request (non-streaming)
+   */
+  private async createAnthropicMessageNative(params: ModelRequest): Promise<ModelResponse> {
+    // Append /v1/messages if not already present (same behavior as SDK)
+    let url = this.configuredBaseURL!;
+    if (!url.endsWith('/v1/messages')) {
+      url = url.replace(/\/$/, '') + '/v1/messages';
+    }
+    const messages = this.convertMessagesToAnthropicFormat(params.messages);
+
+    const requestBody = {
+      model: params.model,
+      max_tokens: params.maxTokens,
+      temperature: params.temperature,
+      system: params.systemPrompt,
+      messages,
+      tools: params.tools,
+    };
+
+    logger.info('[ModelAPI] Native HTTP request to:', url);
+    logger.debug('[ModelAPI] Request body:', JSON.stringify(requestBody, null, 2));
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiKey}`,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error('[ModelAPI] Native HTTP error:', { status: response.status, body: errorText });
+        throw new ModelAPIError(
+          `HTTP ${response.status}: ${errorText}`,
+          'HTTP_ERROR',
+          response.status
+        );
+      }
+
+      const data = await response.json() as any;
+      logger.info('[ModelAPI] Native HTTP response received', {
+        inputTokens: data.usage?.input_tokens,
+        outputTokens: data.usage?.output_tokens,
+      });
+
+      return this.parseAnthropicResponse(data);
+    } catch (error: any) {
+      if (error instanceof ModelAPIError) throw error;
+      logger.error('[ModelAPI] Native HTTP error:', error);
+      throw new ModelAPIError(
+        error.message || 'Network error',
+        'NETWORK_ERROR'
+      );
+    }
+  }
+
+  /**
+   * Create streaming message using native HTTP request (SSE)
+   */
+  private async *createAnthropicMessageStreamNative(
+    params: ModelRequest,
+    streamingHandler?: StreamingHandler
+  ): AsyncGenerator<ModelStreamChunk, void, undefined> {
+    this.resetStreamAccumulator();
+    const messageId = `msg_${Date.now()}`;
+
+    // Append /v1/messages if not already present (same behavior as SDK)
+    let url = this.configuredBaseURL!;
+    if (!url.endsWith('/v1/messages')) {
+      url = url.replace(/\/$/, '') + '/v1/messages';
+    }
+
+    const messages = this.convertMessagesToAnthropicFormat(params.messages);
+
+    const requestBody = {
+      model: params.model,
+      max_tokens: params.maxTokens,
+      temperature: params.temperature,
+      system: params.systemPrompt,
+      messages,
+      tools: params.tools,
+      stream: true,
+    };
+
+    logger.info('[ModelAPI] Native HTTP streaming request to:', url);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiKey}`,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error('[ModelAPI] Native HTTP streaming error:', { status: response.status, body: errorText });
+        throw new ModelAPIError(
+          `HTTP ${response.status}: ${errorText}`,
+          'HTTP_ERROR',
+          response.status
+        );
+      }
+
+      if (!response.body) {
+        throw new ModelAPIError('No response body for streaming', 'STREAM_ERROR');
+      }
+
+      // Emit message start
+      streamingHandler?.emitMessageStart(messageId);
+      yield { type: 'message_start', messageId };
+
+      // Track current tool use block
+      let currentToolId: string | null = null;
+      let currentToolName: string | null = null;
+      let currentToolInput = '';
+
+      // Read SSE stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const jsonStr = line.slice(6).trim();
+            if (!jsonStr || jsonStr === '[DONE]') continue;
+
+            try {
+              const event = JSON.parse(jsonStr);
+
+              switch (event.type) {
+                case 'message_start':
+                  // Already emitted
+                  break;
+
+                case 'content_block_start':
+                  if (event.content_block?.type === 'text') {
+                    yield { type: 'text_start' };
+                  } else if (event.content_block?.type === 'tool_use') {
+                    currentToolId = event.content_block.id;
+                    currentToolName = event.content_block.name;
+                    currentToolInput = '';
+                    streamingHandler?.emitToolStart(currentToolId!, currentToolName!, {});
+                    yield {
+                      type: 'tool_use_start',
+                      toolCall: { id: currentToolId!, name: currentToolName! },
+                    };
+                  }
+                  break;
+
+                case 'content_block_delta':
+                  if (event.delta?.type === 'text_delta') {
+                    const delta = event.delta.text || '';
+                    this.streamAccumulator.content += delta;
+                    streamingHandler?.emitMessageUpdate(messageId, delta, 'text_delta');
+                    yield { type: 'text_delta', delta };
+                  } else if (event.delta?.type === 'input_json_delta') {
+                    currentToolInput += event.delta.partial_json || '';
+                    yield {
+                      type: 'tool_use_delta',
+                      toolCall: { id: currentToolId ?? undefined },
+                      delta: event.delta.partial_json,
+                    };
+                  }
+                  break;
+
+                case 'content_block_stop':
+                  if (currentToolId && currentToolName) {
+                    try {
+                      const input = currentToolInput ? JSON.parse(currentToolInput) : {};
+                      this.streamAccumulator.toolCalls.push({
+                        id: currentToolId,
+                        name: currentToolName,
+                        input,
+                      });
+                    } catch {
+                      this.streamAccumulator.toolCalls.push({
+                        id: currentToolId,
+                        name: currentToolName,
+                        input: {},
+                      });
+                    }
+                    yield { type: 'tool_use_end', toolCall: { id: currentToolId, name: currentToolName } };
+                    currentToolId = null;
+                    currentToolName = null;
+                    currentToolInput = '';
+                  } else {
+                    yield { type: 'text_end' };
+                  }
+                  break;
+
+                case 'message_delta':
+                  if (event.delta?.stop_reason) {
+                    this.streamAccumulator.stopReason = event.delta.stop_reason;
+                  }
+                  if (event.usage) {
+                    this.streamAccumulator.inputTokens = event.usage.input_tokens || 0;
+                    this.streamAccumulator.outputTokens = event.usage.output_tokens || 0;
+                    yield {
+                      type: 'usage',
+                      usage: {
+                        inputTokens: event.usage.input_tokens,
+                        outputTokens: event.usage.output_tokens,
+                      },
+                    };
+                  }
+                  break;
+
+                case 'message_stop':
+                  streamingHandler?.emitMessageEnd(
+                    messageId,
+                    this.streamAccumulator.content,
+                    (this.streamAccumulator.stopReason as any) || 'end_turn',
+                    {
+                      inputTokens: this.streamAccumulator.inputTokens,
+                      outputTokens: this.streamAccumulator.outputTokens,
+                    }
+                  );
+
+                  yield {
+                    type: 'message_end',
+                    stopReason: this.streamAccumulator.stopReason,
+                    usage: {
+                      inputTokens: this.streamAccumulator.inputTokens,
+                      outputTokens: this.streamAccumulator.outputTokens,
+                    },
+                  };
+                  break;
+              }
+            } catch (e) {
+              logger.warn('[ModelAPI] Failed to parse SSE event:', jsonStr);
+            }
+          }
+        }
+      }
+
+      logger.info(
+        `[ModelAPI] Native streaming completed (tokens: ${this.streamAccumulator.inputTokens}/${this.streamAccumulator.outputTokens})`
+      );
+    } catch (error: any) {
+      const errorDetails = {
+        errorName: error?.name,
+        errorMessage: error?.message,
+        configuredBaseURL: this.configuredBaseURL,
+      };
+
+      console.log('[ModelAPI] ========== NATIVE HTTP STREAMING ERROR ==========');
+      console.log('[ModelAPI] Error details:', JSON.stringify(errorDetails, null, 2));
+      console.log('[ModelAPI] ================================================');
+
+      logger.error('[ModelAPI] Native HTTP streaming error:', errorDetails);
+
+      streamingHandler?.emitError(
+        'STREAM_ERROR',
+        error instanceof Error ? error.message : 'Unknown streaming error'
+      );
+
+      if (error instanceof ModelAPIError) throw error;
+      throw new ModelAPIError(
+        error.message || 'Network error',
+        'NETWORK_ERROR'
+      );
     }
   }
 }

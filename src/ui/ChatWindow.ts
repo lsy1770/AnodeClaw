@@ -6,7 +6,7 @@
 
 import type { AgentManager } from '../core/AgentManager.js';
 import type { MessageDisplay } from './types.js';
-import { createMessageBubble, createThinkingIndicator, generateViewId } from './utils.js';
+import { createMessageBubble, createMediaCard, createThinkingIndicator, generateViewId } from './utils.js';
 import { logger } from '../utils/logger.js';
 
 // Declare global FloatingWindowAPI
@@ -26,8 +26,8 @@ declare const floatingWindow: {
   findView(id: string): any | null;
   setText(view: any, text: string): void;
   getText(view: any): string;
-  on(viewId: string, eventType: string, callback: (event: any) => void): boolean;
-  onView(viewId: string, eventType: string, callback: (event: any) => void):boolean;
+  on(eventType: string, callback: (event: any) => void): boolean;
+  onView(viewId: string, eventType: string, callback: (event: any) => void): boolean;
 };
 
 /**
@@ -74,8 +74,8 @@ export class ChatWindow {
     floatingWindow.create(xml);
     floatingWindow.setSize(config.width ?? 700, config.height ?? 1000);
     floatingWindow.setPosition(config.x ?? 50, config.y ?? 100);
-    floatingWindow.setFocusable(false);
     floatingWindow.setTouchable(true);
+    // Don't set focusable here - let the click handler manage it for keyboard
 
     // Setup event listeners
     this.setupEventListeners();
@@ -98,7 +98,6 @@ export class ChatWindow {
       return;
     }
 
-    floatingWindow.setFocusable(false);
     floatingWindow.hide();
     this.isVisible = false;
 
@@ -113,7 +112,6 @@ export class ChatWindow {
       return;
     }
 
-    floatingWindow.setFocusable(false);
     floatingWindow.close();
     this.isVisible = false;
 
@@ -186,38 +184,41 @@ export class ChatWindow {
             android:textColor="#FFFFFF"
             android:textStyle="bold"/>
 
-        <TextView
-      android:id="@+id/btn_sessions"
-      android:layout_width="40dp"
-      android:layout_height="40dp"
-      android:gravity="center"
-      android:text="📋"
-      android:textSize="20sp"
-      android:background="#00000000"
-      android:clickable="true"/>
+        <Button
+            android:id="@+id/btn_sessions"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:text="📋"
+            android:textSize="18sp"
+            android:background="#00000000"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
 
-  <TextView
-      android:id="@+id/btn_settings"
-      android:layout_width="40dp"
-      android:layout_height="40dp"
-      android:gravity="center"
-      android:text="⚙️"
-      android:textSize="20sp"
-      android:background="#00000000"
-      android:layout_marginStart="8dp"
-      android:clickable="true"/>
+        <Button
+            android:id="@+id/btn_settings"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:text="⚙️"
+            android:textSize="18sp"
+            android:background="#00000000"
+            android:layout_marginStart="4dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
 
-  <TextView
-      android:id="@+id/btn_close"
-      android:layout_width="40dp"
-      android:layout_height="40dp"
-      android:gravity="center"
-      android:text="✕"
-      android:textSize="20sp"
-      android:textColor="#FFFFFF"
-      android:background="#00000000"
-      android:layout_marginStart="8dp"
-      android:clickable="true"/>
+        <Button
+            android:id="@+id/btn_close"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:text="✕"
+            android:textSize="18sp"
+            android:textColor="#FFFFFF"
+            android:background="#00000000"
+            android:layout_marginStart="4dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:padding="0dp"/>
     </LinearLayout>
 
     <!-- Message ScrollView -->
@@ -269,27 +270,34 @@ export class ChatWindow {
    * Setup event listeners
    */
   private setupEventListeners(): void {
-    // Per-view click handlers using on(viewId, eventType, callback) pattern
-    floatingWindow.onView('btn_send', 'click', () => {
-      console.log('Send button listener registered:');
+    // Use onView for per-button click handlers
+    const sendSuccess = floatingWindow.onView('btn_send', 'click', () => {
+      logger.debug('[ChatWindow] btn_send clicked');
       this.handleSendMessage();
     });
+    logger.debug(`[ChatWindow] btn_send listener: ${sendSuccess}`);
 
-    floatingWindow.onView('btn_close', 'click', () => {
+    const closeSuccess = floatingWindow.onView('btn_close', 'click', () => {
+      logger.debug('[ChatWindow] btn_close clicked');
       this.hide();
     });
+    logger.debug(`[ChatWindow] btn_close listener: ${closeSuccess}`);
 
-    floatingWindow.onView('btn_sessions', 'click', () => {
+    const sessionsSuccess = floatingWindow.onView('btn_sessions', 'click', () => {
+      logger.info('[ChatWindow] btn_sessions clicked');
       if (this.onSessionChangeCallback) {
         this.onSessionChangeCallback(this.currentSessionId!);
       }
     });
+    logger.debug(`[ChatWindow] btn_sessions listener: ${sessionsSuccess}`);
 
-    floatingWindow.onView('btn_settings', 'click', () => {
+    const settingsSuccess = floatingWindow.onView('btn_settings', 'click', () => {
+      logger.info('[ChatWindow] btn_settings clicked');
       if (this.onSettingsCallback) {
         this.onSettingsCallback();
       }
     });
+    logger.debug(`[ChatWindow] btn_settings listener: ${settingsSuccess}`);
 
     // Input field: toggle focusable on tap so keyboard can open
     floatingWindow.onView('input_message', 'click', () => {
@@ -364,6 +372,7 @@ export class ChatWindow {
           role: 'assistant',
           content: response.content,
           timestamp: Date.now(),
+          attachments: response.attachments,
         });
 
         // Scroll to bottom
@@ -389,7 +398,7 @@ export class ChatWindow {
     const messageBubble = createMessageBubble({
       role: message.role,
       content: message.content,
-    }, message.id);
+    }, message.id, message.attachments);
 
     // Track message view IDs for clearMessages
     this.messageViewIds.push(message.id);
@@ -498,6 +507,7 @@ export class ChatWindow {
             role: msg.role,
             content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
             timestamp: msg.timestamp,
+            attachments: msg.metadata?.attachments,
           });
         }
       }

@@ -1,9 +1,9 @@
 /**
  * Proactive Behavior
  *
- * Heuristic suggestion engine that analyzes daily logs, error patterns,
- * and task history to generate actionable suggestions. Runs as a heartbeat
- * task and after task completion — no model API calls required.
+ * AI-driven suggestion engine that analyzes daily logs, task history,
+ * and context to generate actionable insights. Combines heuristic checks
+ * with optional AI-powered analysis for deeper insights.
  */
 import { EventEmitter } from 'events';
 import { logger } from '../../utils/logger.js';
@@ -24,10 +24,28 @@ const DEFAULT_CONFIG = {
 export class ProactiveBehavior extends EventEmitter {
     constructor(config, memorySystem, dailyLogManager, getActiveSessions) {
         super();
+        /** Track recently sent notifications to prevent spam */
+        this.recentNotifications = new Map();
+        /** Cooldown period for notifications (1 hour) */
+        this.NOTIFICATION_COOLDOWN = 60 * 60 * 1000;
+        /** Optional AI insight generator callback */
+        this.aiInsightGenerator = null;
+        /** Last AI insight timestamp (to rate limit AI calls) */
+        this.lastAIInsightTime = 0;
+        /** Minimum interval between AI insight calls (1 hour) */
+        this.AI_INSIGHT_INTERVAL = 60 * 60 * 1000;
         this.config = { ...DEFAULT_CONFIG, ...config };
         this.memorySystem = memorySystem;
         this.dailyLogManager = dailyLogManager;
         this.getActiveSessions = getActiveSessions;
+    }
+    /**
+     * Set the AI insight generator callback
+     * This is called by AgentManager after initialization
+     */
+    setAIInsightGenerator(generator) {
+        this.aiInsightGenerator = generator;
+        logger.info('[Proactive] AI insight generator registered');
     }
     /**
      * Run all heuristic checks and return suggestions
@@ -39,8 +57,9 @@ export class ProactiveBehavior extends EventEmitter {
             logger.debug('[Proactive] Quiet hours — skipping checks');
             return [];
         }
-        const suggestions = [];
+        let suggestions = [];
         try {
+            // Run heuristic checks in parallel
             const [pending, repeated, idle, errors] = await Promise.all([
                 this.checkPendingTasks(),
                 this.checkRepeatedPatterns(),
@@ -48,6 +67,11 @@ export class ProactiveBehavior extends EventEmitter {
                 this.checkErrorPatterns(),
             ]);
             suggestions.push(...pending, ...repeated, ...idle, ...errors);
+            // Try to generate AI insights (rate-limited internally)
+            const aiInsights = await this.generateAIInsights();
+            suggestions.push(...aiInsights);
+            // Deduplicate - filter out recently sent notifications
+            suggestions = this.deduplicateSuggestions(suggestions);
         }
         catch (err) {
             logger.warn('[Proactive] Check failed:', err);
@@ -214,7 +238,6 @@ export class ProactiveBehavior extends EventEmitter {
                 // Look for repeated error messages
                 const errorCounts = new Map();
                 for (const err of errors) {
-                    // Strip timestamp prefix
                     const msg = err.replace(/^\d{2}:\d{2}:\s*/, '').toLowerCase().trim();
                     const normalized = msg.slice(0, 80);
                     errorCounts.set(normalized, (errorCounts.get(normalized) || 0) + 1);
@@ -223,7 +246,7 @@ export class ProactiveBehavior extends EventEmitter {
                     if (count >= 2) {
                         suggestions.push({
                             type: 'warning',
-                            title: 'Repeated error',
+                            title: `Repeated error (x${count})`,
                             description: `Error "${errMsg.slice(0, 60)}" occurred ${count} times today. This may need investigation.`,
                             priority: 'high',
                             timestamp: Date.now(),
@@ -234,7 +257,7 @@ export class ProactiveBehavior extends EventEmitter {
             if (errors.length >= 5) {
                 suggestions.push({
                     type: 'warning',
-                    title: 'High error rate',
+                    title: `High error rate (${errors.length})`,
                     description: `${errors.length} errors recorded today. System stability may be affected.`,
                     priority: 'high',
                     timestamp: Date.now(),
@@ -246,6 +269,133 @@ export class ProactiveBehavior extends EventEmitter {
         }
         return suggestions;
     }
+    /**
+     * Generate AI-powered insights based on recent activity
+     * Rate-limited to avoid excessive API calls
+     */
+    async generateAIInsights() {
+        if (!this.aiInsightGenerator) {
+            logger.debug('[Proactive] AI insight generator not available');
+            return [];
+        }
+        // Rate limit AI calls
+        const now = Date.now();
+        if (now - this.lastAIInsightTime < this.AI_INSIGHT_INTERVAL) {
+            logger.debug('[Proactive] AI insight rate limited, skipping');
+            return [];
+        }
+        try {
+            // Build context from recent activity
+            const context = await this.buildAIContext();
+            if (!context) {
+                return [];
+            }
+            logger.info('[Proactive] Generating AI insights...');
+            const insight = await this.aiInsightGenerator(context);
+            this.lastAIInsightTime = now;
+            if (!insight || insight.trim().length === 0) {
+                return [];
+            }
+            // Parse the AI response into suggestions
+            return this.parseAIInsight(insight);
+        }
+        catch (err) {
+            logger.warn('[Proactive] AI insight generation failed:', err);
+            return [];
+        }
+    }
+    /**
+     * Build context string for AI analysis
+     */
+    async buildAIContext() {
+        try {
+            const todayLog = await this.dailyLogManager.getTodayLog();
+            const recentLogs = await this.dailyLogManager.getRecentLogs(3);
+            // Skip if no meaningful activity
+            if (todayLog.sessions.length === 0 && todayLog.tasksCompleted.length === 0) {
+                return null;
+            }
+            const lines = [];
+            lines.push('# Recent Activity Summary');
+            lines.push('');
+            // Today's activity
+            lines.push('## Today');
+            if (todayLog.sessions.length > 0) {
+                lines.push(`Sessions: ${todayLog.sessions.length}`);
+                for (const s of todayLog.sessions.slice(-3)) {
+                    lines.push(`- ${s.timeRange}: ${s.summary} (${s.result})`);
+                }
+            }
+            if (todayLog.tasksCompleted.length > 0) {
+                lines.push(`Completed tasks: ${todayLog.tasksCompleted.join(', ')}`);
+            }
+            if (todayLog.tasksPending.length > 0) {
+                lines.push(`Pending tasks: ${todayLog.tasksPending.join(', ')}`);
+            }
+            if (todayLog.errors.length > 0) {
+                lines.push(`Errors today: ${todayLog.errors.length}`);
+            }
+            // Recent patterns
+            const allCompleted = recentLogs.flatMap(l => l.tasksCompleted);
+            if (allCompleted.length > 0) {
+                lines.push('');
+                lines.push('## Recent Tasks (last 3 days)');
+                lines.push(allCompleted.slice(-10).join(', '));
+            }
+            return lines.join('\n');
+        }
+        catch (err) {
+            logger.debug('[Proactive] buildAIContext failed:', err);
+            return null;
+        }
+    }
+    /**
+     * Parse AI response into ProactiveSuggestion array
+     */
+    parseAIInsight(insight) {
+        const suggestions = [];
+        const trimmed = insight.trim();
+        if (trimmed) {
+            // Use first sentence or first 60 chars as title for better dedup
+            const firstSentence = trimmed.split(/[.!?。！？\n]/)[0]?.trim() || 'AI Insight';
+            suggestions.push({
+                type: 'insight',
+                title: firstSentence.slice(0, 60),
+                description: trimmed.slice(0, 500),
+                priority: 'medium',
+                timestamp: Date.now(),
+            });
+        }
+        return suggestions;
+    }
+    /**
+     * Deduplicate suggestions by checking recent notification history
+     * Prevents the same notification from being sent within the cooldown period
+     */
+    deduplicateSuggestions(suggestions) {
+        const now = Date.now();
+        const result = [];
+        // Clean up expired entries
+        for (const [key, timestamp] of this.recentNotifications) {
+            if (now - timestamp > this.NOTIFICATION_COOLDOWN) {
+                this.recentNotifications.delete(key);
+            }
+        }
+        // Filter out recently sent notifications
+        // Key includes type + title + description prefix to distinguish similar suggestions
+        for (const suggestion of suggestions) {
+            const descKey = suggestion.description.slice(0, 40);
+            const key = `${suggestion.type}:${suggestion.title}:${descKey}`;
+            if (!this.recentNotifications.has(key)) {
+                result.push(suggestion);
+                this.recentNotifications.set(key, now);
+            }
+            else {
+                logger.debug(`[Proactive] Skipping duplicate notification: ${suggestion.title}`);
+            }
+        }
+        return result;
+    }
     // ===== Utility methods =====
     /**
      * Check if current time is within quiet hours
@@ -254,11 +404,11 @@ export class ProactiveBehavior extends EventEmitter {
         const hour = new Date().getHours();
         const { quietHoursStart, quietHoursEnd } = this.config;
         if (quietHoursStart <= quietHoursEnd) {
-            // e.g., 23-7 wraps around midnight
-            return hour >= quietHoursStart || hour < quietHoursEnd;
+            // Non-wrapping case, e.g., 8-22 (quiet from 8 AM to 10 PM)
+            return hour >= quietHoursStart && hour < quietHoursEnd;
         }
-        // e.g., 8-22 (quiet from 8 AM to 10 PM — unusual but supported)
-        return hour >= quietHoursStart && hour < quietHoursEnd;
+        // Wrap-around case, e.g., 23-7 (quiet from 11 PM to 7 AM)
+        return hour >= quietHoursStart || hour < quietHoursEnd;
     }
     /**
      * Simple text similarity (Jaccard on word set)

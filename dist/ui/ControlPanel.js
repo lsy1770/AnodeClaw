@@ -38,6 +38,13 @@ export class ControlPanel {
         floatingWindow.show();
         this.isVisible = true;
         logger.info('Control panel shown');
+        // 检查是否需要自动打开聊天窗口
+        const appConfig = this.configManager.get();
+        if (appConfig.ui?.floatingWindow?.autoOpen) {
+            logger.info('Auto-opening chat window based on config');
+            // 延迟启动，确保控制面板完全显示
+            setTimeout(() => this.handleStartChat(), 500);
+        }
     }
     /**
      * 隐藏控制面板
@@ -451,6 +458,30 @@ export class ControlPanel {
                     android:textColor="#333333"
                     android:layout_marginStart="8dp"/>
             </LinearLayout>
+
+            <!-- Auto Open Chat Window -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginTop="12dp">
+
+                <CheckBox
+                    android:id="@+id/check_auto_open_chat"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="false"/>
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="启动时自动打开聊天窗口"
+                    android:textSize="14sp"
+                    android:textColor="#333333"
+                    android:layout_marginStart="8dp"/>
+            </LinearLayout>
         </LinearLayout>
 
         <!-- Action Buttons -->
@@ -608,6 +639,11 @@ export class ControlPanel {
             if (notificationsView && config.ui) {
                 floatingWindow.setChecked(notificationsView, config.ui.notifications.enabled);
             }
+            // Auto Open Chat Window
+            const autoOpenChatView = floatingWindow.findView('check_auto_open_chat');
+            if (autoOpenChatView && config.ui) {
+                floatingWindow.setChecked(autoOpenChatView, config.ui.floatingWindow?.autoOpen ?? false);
+            }
             logger.info('Config loaded to UI');
         }
         catch (error) {
@@ -698,6 +734,14 @@ export class ControlPanel {
             const notificationsView = floatingWindow.findView('check_notifications');
             if (notificationsView && config.ui) {
                 config.ui.notifications.enabled = floatingWindow.isChecked(notificationsView);
+            }
+            // Auto Open Chat Window
+            const autoOpenChatView = floatingWindow.findView('check_auto_open_chat');
+            if (autoOpenChatView && config.ui) {
+                if (!config.ui.floatingWindow) {
+                    config.ui.floatingWindow = { x: 50, y: 100, width: 700, height: 1000, autoOpen: false };
+                }
+                config.ui.floatingWindow.autoOpen = floatingWindow.isChecked(autoOpenChatView);
             }
             // 保存到文件
             await this.configManager.save();

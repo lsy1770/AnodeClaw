@@ -567,6 +567,11 @@ export const androidScreenshotTool: Tool = {
             quality,
             message: 'Screenshot saved successfully',
           },
+          attachments: [{
+            type: 'image',
+            localPath: path,
+            mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+          }],
         };
       } else {
         // Return base64

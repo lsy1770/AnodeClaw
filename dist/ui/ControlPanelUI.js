@@ -167,7 +167,31 @@ export class ControlPanel {
         this.v[id]?.attr?.('checked', checked ? 'true' : 'false');
     }
     getCheckboxState(id) {
-        return this.checkboxStates.get(id) ?? false;
+        // Try to read actual UI state first, fallback to cached state
+        const view = this.v[id];
+        let result = false;
+        let source = 'default';
+        if (view) {
+            // Try different methods to get checkbox state
+            if (typeof view.isChecked === 'function') {
+                result = view.isChecked();
+                source = 'view.isChecked()';
+            }
+            else if (typeof view.attr === 'function') {
+                const checked = view.attr('checked');
+                if (checked !== undefined && checked !== null) {
+                    result = checked === true || checked === 'true';
+                    source = `view.attr('checked')=${checked}`;
+                }
+            }
+        }
+        // Final fallback to cached state
+        if (source === 'default') {
+            result = this.checkboxStates.get(id) ?? false;
+            source = 'checkboxStates Map';
+        }
+        logger.debug(`[ControlPanel] getCheckboxState('${id}') = ${result} (source: ${source})`);
+        return result;
     }
     /** Read text from cached view (fallback to ui.getText) */
     readText(id) {
@@ -301,31 +325,47 @@ export class ControlPanel {
             config.agent.autoSave = this.getCheckboxState('check_auto_save');
             config.agent.compressionEnabled = this.getCheckboxState('check_compression');
             if (!config.ui) {
-                config.ui = { theme: 'auto', floatingWindow: { width: 700, height: 1000, x: 50, y: 100 }, notifications: { enabled: true, showProgress: true } };
+                config.ui = { theme: 'auto', floatingWindow: { width: 700, height: 1000, x: 50, y: 100, autoOpen: false }, notifications: { enabled: true, showProgress: true } };
             }
-            config.ui.notifications.enabled = this.getCheckboxState('check_notifications');
-            // Social
+            if (config.ui.notifications) {
+                config.ui.notifications.enabled = this.getCheckboxState('check_notifications');
+            }
+            // Social - always save enabled state, even if token is empty
             if (!config.social)
                 config.social = {};
+            // Telegram
+            const tgEnabled = this.getCheckboxState('check_telegram_enabled');
             const tgToken = this.readText('edit_telegram_token');
-            if (tgToken)
-                config.social.telegram = { enabled: this.getCheckboxState('check_telegram_enabled'), botToken: tgToken };
+            config.social.telegram = { enabled: tgEnabled, botToken: tgToken || undefined };
+            // QQ
+            const qqEnabled = this.getCheckboxState('check_qq_enabled');
             const qqId = this.readText('edit_qq_appid');
             const qqTok = this.readText('edit_qq_token');
-            if (qqId || qqTok)
-                config.social.qq = { enabled: this.getCheckboxState('check_qq_enabled'), appId: qqId || undefined, token: qqTok || undefined };
+            config.social.qq = { enabled: qqEnabled, appId: qqId || undefined, token: qqTok || undefined };
+            // WeChat
             config.social.wechat = { enabled: this.getCheckboxState('check_wechat_enabled') };
+            // Discord
+            const dcEnabled = this.getCheckboxState('check_discord_enabled');
             const dcTok = this.readText('edit_discord_token');
-            if (dcTok)
-                config.social.discord = { enabled: this.getCheckboxState('check_discord_enabled'), botToken: dcTok };
+            config.social.discord = { enabled: dcEnabled, botToken: dcTok || undefined };
+            // Feishu
+            const fsEnabled = this.getCheckboxState('check_feishu_enabled');
             const fsId = this.readText('edit_feishu_appid');
             const fsSec = this.readText('edit_feishu_secret');
-            if (fsId || fsSec)
-                config.social.feishu = { enabled: this.getCheckboxState('check_feishu_enabled'), appId: fsId || undefined, appSecret: fsSec || undefined };
+            config.social.feishu = { enabled: fsEnabled, appId: fsId || undefined, appSecret: fsSec || undefined };
+            // DingTalk
+            const dtEnabled = this.getCheckboxState('check_dingtalk_enabled');
             const dtKey = this.readText('edit_dingtalk_appkey');
             const dtSec = this.readText('edit_dingtalk_secret');
-            if (dtKey || dtSec)
-                config.social.dingtalk = { enabled: this.getCheckboxState('check_dingtalk_enabled'), appKey: dtKey || undefined, appSecret: dtSec || undefined };
+            config.social.dingtalk = { enabled: dtEnabled, appKey: dtKey || undefined, appSecret: dtSec || undefined };
+            logger.info('[ControlPanel] Saving social config:', {
+                telegram: config.social.telegram?.enabled,
+                qq: config.social.qq?.enabled,
+                wechat: config.social.wechat?.enabled,
+                discord: config.social.discord?.enabled,
+                feishu: config.social.feishu?.enabled,
+                dingtalk: config.social.dingtalk?.enabled,
+            });
             await this.configManager.save();
             logger.info('[ControlPanel] config saved');
             globalApi.toast('配置保存成功', "long");
@@ -342,7 +382,10 @@ export class ControlPanel {
         if (this.isChatRunning)
             return;
         try {
+            // Save UI changes to config before starting chat
+            await this.handleSaveConfig();
             const config = this.configManager.get();
+            logger.info('[ControlPanel] Starting chat with provider:', config.model.provider);
             this.agentManager = new AgentManager(config);
             this.chatWindow = new ChatWindow(this.agentManager);
             await this.chatWindow.show();

@@ -165,6 +165,11 @@ export const resizeImageTool: Tool = {
           format,
           message: 'Image resized successfully',
         },
+        attachments: [{
+          type: 'image',
+          localPath: outputPath,
+          mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+        }],
       };
     } catch (error) {
       return {
@@ -262,6 +267,11 @@ export const cropImageTool: Tool = {
           region: { x, y, width, height },
           message: 'Image cropped successfully',
         },
+        attachments: [{
+          type: 'image',
+          localPath: outputPath,
+          mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+        }],
       };
     } catch (error) {
       return {
@@ -341,6 +351,11 @@ export const rotateImageTool: Tool = {
           degrees,
           message: 'Image rotated successfully',
         },
+        attachments: [{
+          type: 'image',
+          localPath: outputPath,
+          mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+        }],
       };
     } catch (error) {
       return {
@@ -421,6 +436,11 @@ export const flipImageTool: Tool = {
           horizontal,
           message: 'Image flipped successfully',
         },
+        attachments: [{
+          type: 'image',
+          localPath: outputPath,
+          mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+        }],
       };
     } catch (error) {
       return {
@@ -743,6 +763,11 @@ export const gaussianBlurTool: Tool = {
           kernelSize,
           message: 'Gaussian blur applied successfully',
         },
+        attachments: [{
+          type: 'image',
+          localPath: outputPath,
+          mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+        }],
       };
     } catch (error) {
       return {
@@ -824,6 +849,11 @@ export const edgeDetectionTool: Tool = {
           highThreshold,
           message: 'Edge detection applied successfully',
         },
+        attachments: [{
+          type: 'image',
+          localPath: outputPath,
+          mimeType: 'image/png',
+        }],
       };
     } catch (error) {
       return {

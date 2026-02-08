@@ -13,6 +13,7 @@ export class SocialAdapterManager {
         this.adapterRegistry = new Map();
         this.platformMessageHandlers = new Map();
         this.lastActiveChannels = new Map();
+        this.defaultBroadcastChannels = new Map();
     }
     /**
      * Register an adapter
@@ -93,6 +94,14 @@ export class SocialAdapterManager {
     }
   
     /**
+     * Set default broadcast channel for a platform
+     * Used by proactive messages when no user has messaged yet
+     */
+    setDefaultChannel(platformName, chatId) {
+        this.defaultBroadcastChannels.set(platformName, chatId);
+        logger.info(`[SocialAdapter] Default broadcast channel for ${platformName}: ${chatId}`);
+    }
+    /**
      * Broadcast a message to all connected platforms
      * Uses configured default channel or last active channel
      */
@@ -102,12 +111,9 @@ export class SocialAdapterManager {
         for (const [platform, adapter] of this.adapters.entries()) {
             if (!adapter.status.connected)
                 continue;
-            // Determine target chat ID
-            // 1. Configured default
-            // 2. Last active channel
-            // We don't have access to config here directly unless we stored it in adapter wrapper.
-            // But we can check our cache.
-            const chatId = this.lastActiveChannels.get(platform);
+            // Determine target chat ID: last active channel → configured default
+            const chatId = this.lastActiveChannels.get(platform)
+                || this.defaultBroadcastChannels.get(platform);
             if (chatId) {
                 promises.push(adapter.sendMessage({
                     chatId,
@@ -115,6 +121,9 @@ export class SocialAdapterManager {
                 }).catch(err => {
                     logger.error(`[SocialAdapter] Broadcast failed for ${platform}:`, err);
                 }));
+            }
+            else {
+                logger.debug(`[SocialAdapter] No broadcast target for ${platform} (set broadcastChatId in config)`);
             }
         }
         await Promise.all(promises);

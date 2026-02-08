@@ -270,8 +270,13 @@ Use this tool when:
 Guidelines:
 - Use clear, descriptive titles
 - Add relevant tags for easier searching
-- Set appropriate importance level
-- Keep content concise but complete`,
+- Set appropriate importance level:
+  * low: Transient info, can be forgotten
+  * medium: Normal persistence (default)
+  * high: Critical info - automatically appended to MEMORY.md for long-term persistence
+- Keep content concise but complete
+
+Note: High-importance memories are automatically added to the main MEMORY.md file for permanent storage.`,
   category: 'system',
   permissions: ['memory:write'],
   parallelizable: false,

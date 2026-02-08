@@ -50,6 +50,7 @@ export const UIConfigSchema = z.object({
     height: z.number().int().positive().default(1000),
     x: z.number().int().default(50),
     y: z.number().int().default(100),
+    autoOpen: z.boolean().default(false), // 启动时是否自动打开聊天窗口
   }),
   notifications: z.object({
     enabled: z.boolean().default(true),
@@ -64,11 +65,13 @@ export const SocialPlatformConfigSchema = z.object({
   telegram: z.object({
     enabled: z.boolean().default(false),
     botToken: z.string().optional(),
+    broadcastChatId: z.string().optional(),
   }).optional(),
   qq: z.object({
     enabled: z.boolean().default(false),
     appId: z.string().optional(),
     token: z.string().optional(),
+    broadcastChatId: z.string().optional(),
   }).optional(),
   wechat: z.object({
     enabled: z.boolean().default(false),
@@ -77,16 +80,19 @@ export const SocialPlatformConfigSchema = z.object({
   discord: z.object({
     enabled: z.boolean().default(false),
     botToken: z.string().optional(),
+    broadcastChatId: z.string().optional(),
   }).optional(),
   feishu: z.object({
     enabled: z.boolean().default(false),
     appId: z.string().optional(),
     appSecret: z.string().optional(),
+    broadcastChatId: z.string().optional(),
   }).optional(),
   dingtalk: z.object({
     enabled: z.boolean().default(false),
     appKey: z.string().optional(),
     appSecret: z.string().optional(),
+    broadcastChatId: z.string().optional(),
   }).optional(),
 });
 

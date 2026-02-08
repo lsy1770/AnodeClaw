@@ -47,6 +47,12 @@ export interface MessageDisplay {
   role: 'user' | 'assistant';
   content: string;
   timestamp: number;
+  attachments?: Array<{
+    type: 'image' | 'video' | 'audio' | 'file';
+    localPath: string;
+    filename?: string;
+    mimeType?: string;
+  }>;
 }
 
 /**

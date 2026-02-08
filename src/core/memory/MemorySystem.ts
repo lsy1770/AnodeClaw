@@ -125,6 +125,7 @@ export class MemorySystem {
 
   /**
    * Create and save a memory entry
+   * High-importance memories are also appended to MEMORY.md for persistence
    */
   async createMemory(
     title: string,
@@ -136,7 +137,21 @@ export class MemorySystem {
   ): Promise<MemoryEntry> {
     const entry = this.memoryFiles.createEntry(title, content, options);
     await this.memoryFiles.save(entry);
+
+    // Auto-append high-importance memories to MEMORY.md
+    if (options?.importance === 'high') {
+      await this.appendToMainMemory(title, content);
+    }
+
     return entry;
+  }
+
+  /**
+   * Append important information to MEMORY.md main memory file
+   * Called automatically for high-importance memories
+   */
+  async appendToMainMemory(title: string, content: string): Promise<void> {
+    await this.memoryFiles.appendToMainMemory(title, content);
   }
 
   /**
@@ -217,5 +232,22 @@ export class MemorySystem {
       await this.memoryFiles.delete(entry.id);
     }
     logger.info('[MemorySystem] Cleared all memories');
+  }
+
+  /**
+   * Rebuild the memory index
+   * Call this after adding new memory files or when search results seem stale
+   */
+  async rebuildIndex(): Promise<void> {
+    await this.memoryFiles.buildIndex(true);
+    logger.info('[MemorySystem] Memory index rebuilt');
+  }
+
+  /**
+   * Invalidate the memory index
+   * The index will be rebuilt on next search
+   */
+  invalidateIndex(): void {
+    this.memoryFiles.invalidateIndex();
   }
 }

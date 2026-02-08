@@ -125,6 +125,11 @@ export const resizeImageTool = {
                     format,
                     message: 'Image resized successfully',
                 },
+                attachments: [{
+                        type: 'image',
+                        localPath: outputPath,
+                        mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+                    }],
             };
         }
         catch (error) {
@@ -215,6 +220,11 @@ export const cropImageTool = {
                     region: { x, y, width, height },
                     message: 'Image cropped successfully',
                 },
+                attachments: [{
+                        type: 'image',
+                        localPath: outputPath,
+                        mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+                    }],
             };
         }
         catch (error) {
@@ -287,6 +297,11 @@ export const rotateImageTool = {
                     degrees,
                     message: 'Image rotated successfully',
                 },
+                attachments: [{
+                        type: 'image',
+                        localPath: outputPath,
+                        mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+                    }],
             };
         }
         catch (error) {
@@ -360,6 +375,11 @@ export const flipImageTool = {
                     horizontal,
                     message: 'Image flipped successfully',
                 },
+                attachments: [{
+                        type: 'image',
+                        localPath: outputPath,
+                        mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+                    }],
             };
         }
         catch (error) {
@@ -655,6 +675,11 @@ export const gaussianBlurTool = {
                     kernelSize,
                     message: 'Gaussian blur applied successfully',
                 },
+                attachments: [{
+                        type: 'image',
+                        localPath: outputPath,
+                        mimeType: format === 'png' ? 'image/png' : 'image/jpeg',
+                    }],
             };
         }
         catch (error) {
@@ -729,6 +754,11 @@ export const edgeDetectionTool = {
                     highThreshold,
                     message: 'Edge detection applied successfully',
                 },
+                attachments: [{
+                        type: 'image',
+                        localPath: outputPath,
+                        mimeType: 'image/png',
+                    }],
             };
         }
         catch (error) {
