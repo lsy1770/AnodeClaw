@@ -31,8 +31,34 @@ export interface ToolResult {
 export interface MediaAttachment {
   type: 'image' | 'video' | 'audio' | 'file';
   localPath: string;
+  url?: string;
   filename?: string;
   mimeType?: string;
+}
+
+/**
+ * Image content block for multimodal messages
+ */
+export interface ImageContentBlock {
+  type: 'image';
+  source: {
+    type: 'base64' | 'url';
+    media_type: string;
+    data: string;
+  };
+}
+
+/**
+ * File content block for multimodal messages
+ */
+export interface FileContentBlock {
+  type: 'file';
+  source: {
+    type: 'url';
+    url: string;
+    filename?: string;
+    mimeType?: string;
+  };
 }
 
 /**
@@ -42,7 +68,12 @@ export type MessageContent =
   | string
   | ToolCall[]
   | ToolResult[]
-  | Array<{ type: 'text'; text: string } | { type: 'tool_use'; [key: string]: any }>;
+  | Array<
+      | { type: 'text'; text: string }
+      | { type: 'tool_use'; [key: string]: any }
+      | ImageContentBlock
+      | FileContentBlock
+    >;
 
 /**
  * Message structure

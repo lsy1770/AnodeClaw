@@ -1,0 +1,40 @@
+{
+  "configVersion": "2.0",
+  "id": 10001,
+  "projectName": "Andoe Claw",
+  "description": "",
+  "category": "Claw",
+  "version": "1.0.0",
+  "author": "Anode Development Team",
+  "tags": [
+    "UI",
+    "XML Layout",
+    "Event Handling",
+    "Dynamic UI",
+    "Components"
+  ],
+  "projectType": "XML_UI_APPLICATION",
+  "entry": "start-ui.js",
+  "permissions": [
+    "CONSOLE",
+    "OVERLAY"
+  ],
+  "engines": {
+    "minAcsVersion": "1.0.0",
+    "maxAcsVersion": null,
+    "nodeVersion": "18.x",
+    "minAndroidSdk": 26,
+    "maxAndroidSdk": null
+  },
+  "ui": {
+    "supportWebView": false,
+    "supportXmlLayout": true,
+    "initialLayout": null,
+    "width": 0,
+    "height": 0,
+    "resizable": true,
+    "closable": true,
+    "alwaysOnTop": false,
+    "transparent": false
+  }
+}

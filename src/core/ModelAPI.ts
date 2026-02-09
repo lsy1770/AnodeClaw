@@ -11,7 +11,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
-import type { Message, ToolCall } from './types.js';
+import type { Message, ToolCall, MessageContent, ImageContentBlock, FileContentBlock } from './types.js';
 import { logger } from '../utils/logger.js';
 import type { StreamingHandler } from './streaming/index.js';
 
@@ -371,7 +371,7 @@ export class ModelAPI {
       } else {
         result.push({
           role: m.role as 'user' | 'assistant',
-          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+          content: this.buildAnthropicContent(m.content),
         });
       }
     }
@@ -530,7 +530,7 @@ export class ModelAPI {
         // Regular user/assistant message
         result.push({
           role: m.role as 'user' | 'assistant',
-          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+          content: this.buildOpenAIContent(m.content),
         });
       }
     }
@@ -761,6 +761,136 @@ export class ModelAPI {
       'An unknown error occurred',
       'UNKNOWN_ERROR'
     );
+  }
+
+  // ===== Multimodal Content Helpers =====
+
+  /**
+   * Build Anthropic-format content from MessageContent.
+   * Handles string, image blocks, file blocks, and fallback.
+   */
+  private buildAnthropicContent(content: MessageContent): string | any[] {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return JSON.stringify(content);
+
+    // Check if the array contains multimodal blocks
+    const hasMultimodal = content.some(
+      (b: any) => b.type === 'image' || b.type === 'file'
+    );
+    if (!hasMultimodal) return JSON.stringify(content);
+
+    const blocks: any[] = [];
+    for (const block of content as any[]) {
+      if (block.type === 'text') {
+        blocks.push({ type: 'text', text: block.text });
+      } else if (block.type === 'image') {
+        if (block.source?.type === 'base64') {
+          blocks.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: block.source.media_type || 'image/jpeg',
+              data: block.source.data,
+            },
+          });
+        } else if (block.source?.type === 'url') {
+          // Anthropic requires base64; mark URL for async download
+          // At converter time we can't do async, so embed a placeholder
+          // The downloadToBase64 call should happen before conversion
+          // For now, include as URL source — the native HTTP path handles it
+          blocks.push({
+            type: 'image',
+            source: {
+              type: 'url',
+              url: block.source.data,
+            },
+          });
+        }
+      } else if (block.type === 'file') {
+        // Anthropic doesn't support file uploads — degrade to text description
+        const fname = block.source?.filename || block.source?.url || 'unknown';
+        blocks.push({ type: 'text', text: `[File: ${fname}]` });
+      } else {
+        // Pass through (e.g. tool_use)
+        blocks.push(block);
+      }
+    }
+    return blocks.length > 0 ? blocks : JSON.stringify(content);
+  }
+
+  /**
+   * Build OpenAI-format content from MessageContent.
+   * Handles string, image blocks (as image_url), file blocks (as text).
+   */
+  private buildOpenAIContent(content: MessageContent): string | any[] {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return JSON.stringify(content);
+
+    const hasMultimodal = content.some(
+      (b: any) => b.type === 'image' || b.type === 'file'
+    );
+    if (!hasMultimodal) return JSON.stringify(content);
+
+    const blocks: any[] = [];
+    for (const block of content as any[]) {
+      if (block.type === 'text') {
+        blocks.push({ type: 'text', text: block.text });
+      } else if (block.type === 'image') {
+        if (block.source?.type === 'url') {
+          blocks.push({
+            type: 'image_url',
+            image_url: { url: block.source.data },
+          });
+        } else if (block.source?.type === 'base64') {
+          const mediaType = block.source.media_type || 'image/jpeg';
+          blocks.push({
+            type: 'image_url',
+            image_url: { url: `data:${mediaType};base64,${block.source.data}` },
+          });
+        }
+      } else if (block.type === 'file') {
+        const fname = block.source?.filename || block.source?.url || 'unknown';
+        blocks.push({ type: 'text', text: `[File: ${fname}]` });
+      } else {
+        blocks.push(block);
+      }
+    }
+    return blocks.length > 0 ? blocks : JSON.stringify(content);
+  }
+
+  /**
+   * Download a remote image URL to base64.
+   * Returns null on failure (caller should degrade to text).
+   */
+  async downloadToBase64(url: string): Promise<{ media_type: string; data: string } | null> {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        logger.warn(`[ModelAPI] Failed to download image: HTTP ${response.status}`);
+        return null;
+      }
+
+      // Check content length (limit 5MB)
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength) > 5 * 1024 * 1024) {
+        logger.warn(`[ModelAPI] Image too large (${contentLength} bytes), skipping download`);
+        return null;
+      }
+
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > 5 * 1024 * 1024) {
+        logger.warn(`[ModelAPI] Image too large (${buffer.byteLength} bytes), skipping`);
+        return null;
+      }
+
+      const base64 = Buffer.from(buffer).toString('base64');
+      const media_type = response.headers.get('content-type') || 'image/jpeg';
+
+      return { media_type, data: base64 };
+    } catch (error) {
+      logger.warn(`[ModelAPI] Failed to download image from ${url}:`, error);
+      return null;
+    }
   }
 
   /**

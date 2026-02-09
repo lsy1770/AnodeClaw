@@ -2,31 +2,41 @@
  * Network Tools
  *
  * Built-in tools for HTTP requests and network operations
- * Based on anode-api.d.ts definitions
+ * Based on NetworkAPI.kt definitions
  */
 
 import { z } from 'zod';
 import type { Tool, ToolResult, ToolExecutionOptions } from '../types.js';
 import { logger } from '../../utils/logger.js';
 
-// Anode http global (based on anode-api.d.ts)
+// Anode http global (matches NetworkAPI.kt moduleId = "http")
 declare const http: {
-  getIsConnected(): boolean;  // Synchronous!
-  getNetworkType(): string;  // Synchronous!
-  httpGet(urlString: string, headers?: Record<string, string> | null): Promise<any>;
-  httpPost(urlString: string, body?: any | null, headers?: Record<string, string> | null): Promise<any>;
+  getIsConnected(): boolean;
+  getNetworkType(): string;
+  httpGet(urlString: string, headers?: Record<string, string>): Promise<any>;
+  httpPost(urlString: string, body?: any, headers?: Record<string, string>): Promise<any>;
   checkUrlAccessible(urlString: string): Promise<boolean>;
-  uploadFile(urlString: string, filePath: string, params?: Record<string, any> | null, headers?: Record<string, string> | null): Promise<any>;
-  uploadFiles(urlString: string, filePaths: string[], params?: Record<string, any> | null, headers?: Record<string, string> | null): Promise<any>;
+  uploadFile(urlString: string, filePath: string, params?: Record<string, any>, headers?: Record<string, string>): Promise<any>;
+  uploadFiles(urlString: string, filePaths: string[], params?: Record<string, any>, headers?: Record<string, string>): Promise<any>;
 };
 
-// Anode FileAPI global (based on anode-api.d.ts)
-declare const fileAPI: {
-  writeText(path: string, content: string, charset?: string | null): Promise<boolean>;
+// Anode file global for download support
+declare const file: {
+  writeText(path: string, content: string, charset?: string): Promise<boolean>;
   writeBytes(path: string, bytes: Uint8Array): Promise<boolean>;
   createDirectory(path: string): Promise<any>;
-  decodeBase64(base64: string, outputPath: string): Promise<boolean>;
 };
+
+/**
+ * Serialize body to JSON string for Kotlin interop.
+ * Kotlin's toJsonString() extension only handles Map/List — a Javet V8ValueObject
+ * is neither, so .toString() produces garbage. Always stringify on the JS side.
+ */
+function serializeBody(body: any): string | undefined {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === 'string') return body;
+  return JSON.stringify(body);
+}
 
 /**
  * HTTP GET Request Tool
@@ -59,7 +69,10 @@ export const httpGetTool: Tool = {
 
       logger.debug(`HTTP GET request to: ${url}`);
 
-      const response = await http.httpGet(url, headers || null);
+      // Only pass headers when provided — avoids Javet null→Map conversion issues
+      const response = headers && Object.keys(headers).length > 0
+        ? await http.httpGet(url, headers)
+        : await http.httpGet(url);
 
       return {
         success: true,
@@ -118,7 +131,14 @@ export const httpPostTool: Tool = {
 
       logger.debug(`HTTP POST request to: ${url}`);
 
-      const response = await http.httpPost(url, body || null, headers || null);
+      // Serialize body to string — Kotlin's toJsonString() can't handle raw V8 objects
+      const bodyStr = serializeBody(body);
+
+      const response = (headers && Object.keys(headers).length > 0)
+        ? await http.httpPost(url, bodyStr, headers)
+        : bodyStr !== undefined
+          ? await http.httpPost(url, bodyStr)
+          : await http.httpPost(url);
 
       return {
         success: true,
@@ -141,7 +161,8 @@ export const httpPostTool: Tool = {
 };
 
 /**
- * HTTP Request Tool (Generic - uses fetch for flexibility)
+ * HTTP Request Tool (Generic)
+ * Uses native Anode http for GET/POST, fetch fallback for other methods
  */
 export const httpRequestTool: Tool = {
   name: 'http_request',
@@ -187,48 +208,54 @@ export const httpRequestTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { url, method = 'GET', headers = {}, body, timeout = 30000 } = params;
+      const { url, method = 'GET', headers, body, timeout = 30000 } = params;
 
       logger.debug(`HTTP ${method} request to: ${url}`);
 
-      // Serialize body if it's an object
-      let bodyStr: string | undefined;
-      if (body !== undefined && body !== null) {
-        bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
-      }
+      const bodyStr = serializeBody(body);
+      const hasHeaders = headers && Object.keys(headers).length > 0;
 
-      // For GET/POST, prefer Anode's native http
+      // GET — use native Anode http
       if (method === 'GET' && !bodyStr) {
-        const response = await http.httpGet(url, headers || null);
+        const response = hasHeaders
+          ? await http.httpGet(url, headers)
+          : await http.httpGet(url);
         return {
           success: true,
-          output: {
-            url,
-            method,
-            data: response,
-          },
+          output: { url, method, data: response },
         };
       }
 
+      // POST — use native Anode http
       if (method === 'POST') {
-        const response = await http.httpPost(url, bodyStr || null, headers || null);
+        const response = hasHeaders
+          ? await http.httpPost(url, bodyStr, headers)
+          : bodyStr !== undefined
+            ? await http.httpPost(url, bodyStr)
+            : await http.httpPost(url);
         return {
           success: true,
-          output: {
-            url,
-            method,
-            data: response,
+          output: { url, method, data: response },
+        };
+      }
+
+      // Other methods (PUT/DELETE/PATCH/HEAD) — use fetch if available
+      if (typeof globalThis.fetch !== 'function') {
+        return {
+          success: false,
+          error: {
+            code: 'METHOD_NOT_SUPPORTED',
+            message: `HTTP method ${method} is not supported in this environment. Only GET and POST are available via native API.`,
           },
         };
       }
 
-      // For other methods, use fetch
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeout);
 
       const response = await fetch(url, {
         method,
-        headers,
+        headers: hasHeaders ? headers : undefined,
         body: bodyStr ? bodyStr : undefined,
         signal: controller.signal,
       });
@@ -238,7 +265,6 @@ export const httpRequestTool: Tool = {
       const responseText = await response.text();
       let responseData: any = responseText;
 
-      // Try to parse as JSON
       try {
         responseData = JSON.parse(responseText);
       } catch {
@@ -284,7 +310,6 @@ export const checkNetworkTool: Tool = {
     try {
       logger.debug('Checking network status');
 
-      // These are synchronous
       const isConnected = http.getIsConnected();
       const networkType = http.getNetworkType();
 
@@ -398,12 +423,18 @@ export const uploadFileTool: Tool = {
 
       logger.debug(`Uploading file: ${filePath} to ${url}`);
 
-      const response = await http.uploadFile(
-        url,
-        filePath,
-        formParams || null,
-        headers || null
-      );
+      // Build arguments — only pass what's needed to avoid Javet null→Map issues
+      let response: any;
+      const hasParams = formParams && Object.keys(formParams).length > 0;
+      const hasHeaders = headers && Object.keys(headers).length > 0;
+
+      if (hasHeaders) {
+        response = await http.uploadFile(url, filePath, hasParams ? formParams : undefined, headers);
+      } else if (hasParams) {
+        response = await http.uploadFile(url, filePath, formParams);
+      } else {
+        response = await http.uploadFile(url, filePath);
+      }
 
       return {
         success: true,
@@ -428,6 +459,7 @@ export const uploadFileTool: Tool = {
 
 /**
  * Download File Tool
+ * Uses native httpGet + file API. Falls back to fetch for binary content.
  */
 export const downloadFileTool: Tool = {
   name: 'download_file',
@@ -464,45 +496,56 @@ export const downloadFileTool: Tool = {
 
       logger.debug(`Downloading file from: ${url}`);
 
-      // Use fetch to download
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-      const response = await fetch(url, {
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      // Get file content as ArrayBuffer
-      const arrayBuffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-
       // Ensure parent directory exists
       const pathParts = path.split('/');
       if (pathParts.length > 1) {
         const dir = pathParts.slice(0, -1).join('/');
         try {
-          await fileAPI.createDirectory(dir);
+          await file.createDirectory(dir);
         } catch (e) {
-          // Directory might already exist, ignore error
+          // Directory might already exist
         }
       }
 
-      // Write file using Anode FileAPI
-      await fileAPI.writeBytes(path, bytes);
+      // Try fetch first (supports binary), fall back to httpGet (text only)
+      if (typeof globalThis.fetch === 'function') {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+        const response = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        await file.writeBytes(path, bytes);
+
+        return {
+          success: true,
+          output: {
+            url,
+            path,
+            size: arrayBuffer.byteLength,
+            message: 'File downloaded successfully',
+          },
+        };
+      }
+
+      // Fallback: use native httpGet (works for text/JSON content)
+      const content = await http.httpGet(url);
+      const text = typeof content === 'string' ? content : JSON.stringify(content);
+      await file.writeText(path, text);
 
       return {
         success: true,
         output: {
           url,
           path,
-          size: arrayBuffer.byteLength,
-          message: 'File downloaded successfully',
+          size: text.length,
+          message: 'File downloaded successfully (text mode)',
         },
       };
     } catch (error) {

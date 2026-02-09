@@ -1,0 +1,33 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "ES2022",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": [
+    "src/types/anode-global.d.ts",
+    "src/main.ts",
+    "src/cli.ts",
+    "src/start-ui.ts",
+    "src/index.ts",
+    "src/test-simple.ts",
+    "src/core/**/*",
+    "src/tools/**/*",
+    "src/config/**/*",
+    "src/utils/**/*",
+    "src/ui/**/*",
+    "src/social/**/*",
+    "src/skills/**/*",
+    "src/plugins/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "tests",
+    "**/*.test.ts",
+    "**/*.spec.ts"
+  ]
+}

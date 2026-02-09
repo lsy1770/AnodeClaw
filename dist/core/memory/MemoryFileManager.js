@@ -129,6 +129,11 @@ export class MemoryFileManager {
             existing = existing.replace(/Last updated: \d{4}-\d{2}-\d{2}/, `Last updated: ${new Date().toISOString().slice(0, 10)}`);
             await this.writeFile(memoryPath, existing);
             logger.info(`[Memory] Appended to MEMORY.md: ${title}`);
+            // Incrementally update the MEMORY_MAIN entry in the vector index
+            // so new content is searchable without a full restart
+            const indexText = `MEMORY Main Memory ${title} ${content} ${existing}`;
+            this.vectorIndex.add('MEMORY_MAIN', indexText);
+            logger.debug('[Memory] Updated MEMORY_MAIN in vector index');
         }
         catch (err) {
             logger.warn(`[Memory] Failed to append to MEMORY.md:`, err);

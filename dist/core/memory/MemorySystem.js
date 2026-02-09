@@ -88,13 +88,13 @@ export class MemorySystem {
     }
     /**
      * Create and save a memory entry
-     * High-importance memories are also appended to MEMORY.md for persistence
+     * Medium and high importance memories are also appended to MEMORY.md for persistence
      */
     async createMemory(title, content, options) {
         const entry = this.memoryFiles.createEntry(title, content, options);
         await this.memoryFiles.save(entry);
-        // Auto-append high-importance memories to MEMORY.md
-        if (options?.importance === 'high') {
+        // Auto-append medium/high-importance memories to MEMORY.md
+        if (options?.importance === 'high' || options?.importance === 'medium') {
             await this.appendToMainMemory(title, content);
         }
         return entry;

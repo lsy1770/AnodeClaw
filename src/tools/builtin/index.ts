@@ -19,6 +19,7 @@ import { notificationTools } from './NotificationTools.js';
 import { notificationListenerTools } from './NotificationListenerTools.js';
 import { memoryTools, setMemorySystem } from './MemoryTools.js';
 import { subAgentTools, setSubAgentCoordinator } from './SubAgentTools.js';
+import { ocrTools } from './OcrTools.js';
 
 /**
  * All built-in tools
@@ -36,6 +37,7 @@ export const builtinTools: Tool[] = [
   ...notificationListenerTools,
   ...memoryTools,
   ...subAgentTools,
+  ...ocrTools,
 ];
 
 /**
@@ -77,4 +79,5 @@ export {
   setMemorySystem,
   subAgentTools,
   setSubAgentCoordinator,
+  ocrTools,
 };

@@ -38,6 +38,8 @@ import { SubAgentCoordinator } from './subagents/SubAgentCoordinator.js';
 import { SnapshotGenerator } from './snapshot/SnapshotGenerator.js';
 import { performanceMonitor } from '../utils/performance.js';
 import { StreamingHandler } from './streaming/StreamingHandler.js';
+import { getToolHooksManager } from './tools/ToolHooks.js';
+import { EventBus } from './EventBus.js';
 /**
  * Agent Manager Class
  *
@@ -143,6 +145,10 @@ export class AgentManager {
                 try {
                     // Save to persistent memory
                     await this.memorySystem.saveMemory(entry);
+                    // Also append to MEMORY.md for medium/high importance
+                    if (entry.importance === 'high' || entry.importance === 'medium') {
+                        await this.memorySystem.appendToMainMemory(entry.title, entry.content);
+                    }
                     // Log to daily log as an insight
                     await this.dailyLogManager.logInsight(`Session summary saved: "${entry.title}"`);
                 }
@@ -157,6 +163,10 @@ export class AgentManager {
             saveMemory: async (entry) => {
                 try {
                     await this.memorySystem.saveMemory(entry);
+                    // Also append to MEMORY.md for medium/high importance
+                    if (entry.importance === 'high' || entry.importance === 'medium') {
+                        await this.memorySystem.appendToMainMemory(entry.title, entry.content);
+                    }
                     await this.dailyLogManager.logInsight(`Context flushed to memory: "${entry.title}"`);
                 }
                 catch (error) {
@@ -262,6 +272,13 @@ If there's nothing noteworthy, respond with an empty string.`,
         this.snapshotGenerator = new SnapshotGenerator();
         // Initialize Streaming Handler
         this.streamingHandler = new StreamingHandler();
+        // Initialize EventBus
+        this.eventBus = EventBus.getInstance();
+        // Initialize Tool Hooks Manager
+        this.toolHooksManager = getToolHooksManager();
+        this.registerDefaultToolHooks();
+        // Register EventBus consumers
+        this.registerEventBusConsumers();
         // Initialize Social - (Already initialized above)
         this.initializeSocial();
         // Connect social adapter to approval manager for Telegram approval flow
@@ -390,6 +407,8 @@ If there's nothing noteworthy, respond with an empty string.`,
                 const basePrompt = await this.promptBuilder.buildPrompt({
                     sessionId,
                     currentTime: new Date().toISOString(),
+                    Current_Time: new Date().toISOString(),
+                    Session_ID: sessionId,
                 });
                 // Build comprehensive system prompt with SystemPromptBuilder
                 const allTools = this.toolRegistry.getAll();
@@ -415,7 +434,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 };
                 // Build full system prompt params
                 const promptParams = {
-                    workspaceDir: this.config.storage.sessionDir,
+                    workspaceDir: process.cwd(),
                     tools: allTools,
                     toolSummaries,
                     skills: {
@@ -539,14 +558,14 @@ If there's nothing noteworthy, respond with an empty string.`,
      * @param message - User message
      * @returns Agent response
      */
-    async sendMessage(sessionId, message) {
+    async sendMessage(sessionId, message, attachments) {
         // Use lane system to serialize execution per session
         return this.laneManager.enqueue(sessionId, {
             id: `msg-${Date.now()}`,
             name: `sendMessage:${sessionId}`,
             priority: 'normal',
             execute: async () => {
-                return this.processSendMessage(sessionId, message);
+                return this.processSendMessage(sessionId, message, attachments);
             },
         });
     }
@@ -558,21 +577,21 @@ If there's nothing noteworthy, respond with an empty string.`,
      * @param onStream - Callback for streaming updates (delta, accumulated, done)
      * @returns Agent response
      */
-    async sendMessageWithStreaming(sessionId, message, onStream) {
+    async sendMessageWithStreaming(sessionId, message, onStream, attachments) {
         // Use lane system to serialize execution per session
         return this.laneManager.enqueue(sessionId, {
             id: `msg-${Date.now()}`,
             name: `sendMessage:${sessionId}`,
             priority: 'normal',
             execute: async () => {
-                return this.processSendMessageWithStreaming(sessionId, message, onStream);
+                return this.processSendMessageWithStreaming(sessionId, message, onStream, attachments);
             },
         });
     }
     /**
      * Internal method to process send message (called by lane)
      */
-    async processSendMessage(sessionId, message) {
+    async processSendMessage(sessionId, message, attachments) {
         const requestTimer = performanceMonitor.startTimer(`request:${sessionId}`);
         try {
             // Get or load session
@@ -581,10 +600,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                 session = await this.loadSession(sessionId);
             }
             logger.info(`Processing message for session: ${sessionId}`);
-            // Add user message
+            // Add user message (with multimodal content if attachments present)
+            const userContent = await this.buildUserContent(message, attachments);
             session.addMessage({
                 role: 'user',
-                content: message,
+                content: userContent,
             });
             // Log to memory system
             this.memorySystem.appendLog(sessionId, {
@@ -621,14 +641,33 @@ If there's nothing noteworthy, respond with an empty string.`,
                 // Update session with compressed messages
                 session.replaceHistory(compressedMessages);
                 logger.info(`[AgentManager] Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`);
+                // Emit session:compress event
+                this.eventBus.emit('session:compress', {
+                    sessionId,
+                    beforeCount: currentMessages.length,
+                    afterCount: compressedMessages.length,
+                });
+                // Trigger session memory hook to save summary of compressed context
+                try {
+                    const summary = createEmptySessionSummary(sessionId, Date.now());
+                    const compressedText = currentMessages
+                        .filter(m => m.role !== 'system')
+                        .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content.slice(0, 200) : '[Complex]'}`)
+                        .join('\n');
+                    summary.summaryText = compressedText.slice(0, 3000);
+                    summary.topics = ['Context Compression'];
+                    await this.sessionMemoryHook.onSessionEnd(summary, currentMessages.length);
+                    logger.debug('[AgentManager] Session memory saved after context compression');
+                }
+                catch (err) {
+                    logger.debug('[AgentManager] Session memory hook after compression failed:', err);
+                }
             }
-            // Tool execution loop (max iterations to prevent infinite loops)
-            // Configurable via agent.maxToolIterations, default 20
-            const maxIterations = this.config.agent.maxToolIterations || 20;
+            // Tool execution loop (no iteration limit - on device, almost all actions are tool calls)
             let iteration = 0;
             let finalResponse = null;
             const accumulatedAttachments = [];
-            while (iteration < maxIterations) {
+            while (true) {
                 iteration++;
                 logger.debug(`Tool loop iteration: ${iteration}`);
                 // Build context
@@ -657,6 +696,18 @@ If there's nothing noteworthy, respond with an empty string.`,
                     catch (err) {
                         logger.debug('[SemanticMemory] Context enrichment failed:', err);
                     }
+                    // Inject persistent memories from MemorySystem
+                    try {
+                        const memories = await this.memorySystem.semanticSearch(message, 5);
+                        if (memories.length > 0) {
+                            const memoryContext = memories.map(m => `- **${m.entry.title}**: ${m.entry.content.slice(0, 300)}`).join('\n');
+                            systemPrompt += '\n\n## Relevant Memories\n' + memoryContext;
+                            logger.debug(`[MemorySystem] Injected ${memories.length} persistent memory(s) into prompt`);
+                        }
+                    }
+                    catch (err) {
+                        logger.debug('[MemorySystem] Memory search failed:', err);
+                    }
                 }
                 // Filter out system message from messages
                 const messages = context.filter((m) => m.role !== 'system');
@@ -665,7 +716,9 @@ If there's nothing noteworthy, respond with an empty string.`,
                 const toolDecision = ToolUsageStrategy.analyzeMessage(message, toolMode);
                 let tools;
                 if (toolDecision.shouldIncludeTools) {
-                    const allTools = this.toolRegistry.toAnthropicFormat();
+                    const registryTools = this.toolRegistry.toAnthropicFormat();
+                    const skillTools = this.skillManager.toAnthropicFormat();
+                    const allTools = [...registryTools, ...skillTools];
                     if (toolDecision.toolFilter && toolDecision.toolFilter.length > 0) {
                         // Filter tools by category
                         const allRegistered = this.toolRegistry.getAll();
@@ -674,6 +727,10 @@ If there's nothing noteworthy, respond with an empty string.`,
                             if (toolDecision.toolFilter.includes(reg.category)) {
                                 filteredNames.add(reg.name);
                             }
+                        }
+                        // Always include skill tools (they have skill_ prefix)
+                        for (const st of skillTools) {
+                            filteredNames.add(st.name);
                         }
                         tools = filteredNames.size > 0
                             ? allTools.filter((t) => filteredNames.has(t.name))
@@ -732,13 +789,64 @@ If there's nothing noteworthy, respond with an empty string.`,
                         ...approvedToolCalls.map(async (toolCall) => {
                             const toolTimer = performanceMonitor.startTimer(`tool:${toolCall.name}`);
                             try {
-                                const result = await this.toolExecutor.execute(toolCall, {
-                                    context: {
+                                // Route skill_* calls to SkillManager
+                                let result;
+                                if (toolCall.name.startsWith('skill_')) {
+                                    const skillId = toolCall.name.replace('skill_', '');
+                                    const skillResult = await this.skillManager.execute(skillId, toolCall.input);
+                                    result = {
+                                        success: skillResult.success,
+                                        output: skillResult.output != null ? (typeof skillResult.output === 'string' ? skillResult.output : JSON.stringify(skillResult.output)) : skillResult.error || 'Skill completed',
+                                        error: skillResult.error,
+                                    };
+                                }
+                                else {
+                                    // Execute before hooks
+                                    const hookCtx = {
+                                        callId: toolCall.id,
+                                        toolName: toolCall.name,
+                                        args: toolCall.input,
                                         sessionId: session.sessionId,
-                                    },
+                                        timestamp: Date.now(),
+                                    };
+                                    const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
+                                    if (!beforeResult.proceed) {
+                                        result = {
+                                            success: beforeResult.overrideResult !== undefined,
+                                            output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
+                                            error: beforeResult.overrideResult === undefined ? beforeResult.blockReason : undefined,
+                                        };
+                                    }
+                                    else {
+                                        const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
+                                        result = await this.toolExecutor.execute({ ...toolCall, input: effectiveInput }, {
+                                            context: {
+                                                sessionId: session.sessionId,
+                                            },
+                                        });
+                                    }
+                                    // Execute after hooks
+                                    const afterCtx = {
+                                        ...hookCtx,
+                                        result: result.output,
+                                        isError: !result.success,
+                                        duration: Date.now() - hookCtx.timestamp,
+                                    };
+                                    const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
+                                    if (afterResult.modifiedResult !== undefined) {
+                                        result.output = afterResult.modifiedResult;
+                                    }
+                                }
+                                // Emit tool:after event
+                                const toolDuration = toolTimer.end();
+                                this.eventBus.emit('tool:after', {
+                                    toolName: toolCall.name,
+                                    args: toolCall.input,
+                                    result: result.output,
+                                    duration: toolDuration,
+                                    sessionId: session.sessionId,
                                 });
                                 // Record tool execution performance
-                                const toolDuration = toolTimer.end();
                                 performanceMonitor.recordToolExecution(toolDuration);
                                 // Update approval record with execution result
                                 this.approvalManager.updateExecutionResult(toolCall.id, {
@@ -800,17 +908,6 @@ If there's nothing noteworthy, respond with an empty string.`,
                     break;
                 }
             }
-            if (iteration >= maxIterations) {
-                logger.warn('Tool loop exceeded max iterations');
-                finalResponse = {
-                    type: 'error',
-                    content: 'Tool execution loop exceeded maximum iterations',
-                    error: {
-                        code: 'MAX_ITERATIONS',
-                        message: 'Too many tool calls',
-                    },
-                };
-            }
             // Record performance metrics
             const requestDuration = requestTimer.end();
             performanceMonitor.recordRequest(requestDuration);
@@ -851,7 +948,7 @@ If there's nothing noteworthy, respond with an empty string.`,
     /**
      * Internal method to process send message with streaming (called by lane)
      */
-    async processSendMessageWithStreaming(sessionId, message, onStream) {
+    async processSendMessageWithStreaming(sessionId, message, onStream, attachments) {
         const requestTimer = performanceMonitor.startTimer(`request:${sessionId}`);
         try {
             // Get or load session
@@ -860,10 +957,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                 session = await this.loadSession(sessionId);
             }
             logger.info(`Processing message with streaming for session: ${sessionId}`);
-            // Add user message
+            // Add user message (with multimodal content if attachments present)
+            const userContent = await this.buildUserContent(message, attachments);
             session.addMessage({
                 role: 'user',
-                content: message,
+                content: userContent,
             });
             // Log to memory system
             this.memorySystem.appendLog(sessionId, {
@@ -897,13 +995,34 @@ If there's nothing noteworthy, respond with an empty string.`,
                 logger.info(`[AgentManager] Auto-compressing context: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
                 const compressedMessages = await this.contextGuard.autoCompress(currentMessages);
                 logger.info(`[AgentManager] Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`);
+                // Update session with compressed messages
+                session.replaceHistory(compressedMessages);
+                // Emit session:compress event
+                this.eventBus.emit('session:compress', {
+                    sessionId,
+                    beforeCount: currentMessages.length,
+                    afterCount: compressedMessages.length,
+                });
+                // Trigger session memory hook to save summary of compressed context
+                try {
+                    const summary = createEmptySessionSummary(sessionId, Date.now());
+                    const compressedText = currentMessages
+                        .filter(m => m.role !== 'system')
+                        .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content.slice(0, 200) : '[Complex]'}`)
+                        .join('\n');
+                    summary.summaryText = compressedText.slice(0, 3000);
+                    summary.topics = ['Context Compression'];
+                    await this.sessionMemoryHook.onSessionEnd(summary, currentMessages.length);
+                }
+                catch (err) {
+                    logger.debug('[AgentManager] Session memory hook after compression failed:', err);
+                }
             }
-            // Tool execution loop
-            const maxIterations = this.config.agent.maxToolIterations || 20;
+            // Tool execution loop (no iteration limit)
             let iteration = 0;
             let finalResponse = null;
             const accumulatedAttachments = [];
-            while (iteration < maxIterations) {
+            while (true) {
                 iteration++;
                 logger.debug(`Tool loop iteration: ${iteration}`);
                 // Build context
@@ -927,6 +1046,18 @@ If there's nothing noteworthy, respond with an empty string.`,
                     catch (err) {
                         logger.debug('[SemanticMemory] Context enrichment failed:', err);
                     }
+                    // Inject persistent memories from MemorySystem
+                    try {
+                        const memories = await this.memorySystem.semanticSearch(message, 5);
+                        if (memories.length > 0) {
+                            const memoryContext = memories.map(m => `- **${m.entry.title}**: ${m.entry.content.slice(0, 300)}`).join('\n');
+                            systemPrompt += '\n\n## Relevant Memories\n' + memoryContext;
+                            logger.debug(`[MemorySystem] Injected ${memories.length} persistent memory(s) into prompt`);
+                        }
+                    }
+                    catch (err) {
+                        logger.debug('[MemorySystem] Memory search failed:', err);
+                    }
                 }
                 // Filter out system message
                 const messages = context.filter((m) => m.role !== 'system');
@@ -935,7 +1066,9 @@ If there's nothing noteworthy, respond with an empty string.`,
                 const toolDecision = ToolUsageStrategy.analyzeMessage(message, toolMode);
                 let tools;
                 if (toolDecision.shouldIncludeTools) {
-                    const allTools = this.toolRegistry.toAnthropicFormat();
+                    const registryTools = this.toolRegistry.toAnthropicFormat();
+                    const skillTools = this.skillManager.toAnthropicFormat();
+                    const allTools = [...registryTools, ...skillTools];
                     if (toolDecision.toolFilter && toolDecision.toolFilter.length > 0) {
                         const allRegistered = this.toolRegistry.getAll();
                         const filteredNames = new Set();
@@ -943,6 +1076,10 @@ If there's nothing noteworthy, respond with an empty string.`,
                             if (toolDecision.toolFilter.includes(reg.category)) {
                                 filteredNames.add(reg.name);
                             }
+                        }
+                        // Always include skill tools
+                        for (const st of skillTools) {
+                            filteredNames.add(st.name);
                         }
                         tools = filteredNames.size > 0
                             ? allTools.filter((t) => filteredNames.has(t.name))
@@ -1063,11 +1200,60 @@ If there's nothing noteworthy, respond with an empty string.`,
                         ...approvedToolCalls.map(async (toolCall) => {
                             const toolTimer = performanceMonitor.startTimer(`tool:${toolCall.name}`);
                             try {
-                                const result = await this.toolExecutor.execute(toolCall, {
-                                    context: { sessionId: session.sessionId },
+                                let result;
+                                if (toolCall.name.startsWith('skill_')) {
+                                    const skillId = toolCall.name.replace('skill_', '');
+                                    const skillResult = await this.skillManager.execute(skillId, toolCall.input);
+                                    result = {
+                                        success: skillResult.success,
+                                        output: skillResult.output != null ? (typeof skillResult.output === 'string' ? skillResult.output : JSON.stringify(skillResult.output)) : skillResult.error || 'Skill completed',
+                                        error: skillResult.error,
+                                    };
+                                }
+                                else {
+                                    // Execute before hooks
+                                    const hookCtx = {
+                                        callId: toolCall.id,
+                                        toolName: toolCall.name,
+                                        args: toolCall.input,
+                                        sessionId: session.sessionId,
+                                        timestamp: Date.now(),
+                                    };
+                                    const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
+                                    if (!beforeResult.proceed) {
+                                        result = {
+                                            success: beforeResult.overrideResult !== undefined,
+                                            output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
+                                            error: beforeResult.overrideResult === undefined ? beforeResult.blockReason : undefined,
+                                        };
+                                    }
+                                    else {
+                                        const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
+                                        result = await this.toolExecutor.execute({ ...toolCall, input: effectiveInput }, {
+                                            context: { sessionId: session.sessionId },
+                                        });
+                                    }
+                                    // Execute after hooks
+                                    const afterCtx = {
+                                        ...hookCtx,
+                                        result: result.output,
+                                        isError: !result.success,
+                                        duration: Date.now() - hookCtx.timestamp,
+                                    };
+                                    const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
+                                    if (afterResult.modifiedResult !== undefined) {
+                                        result.output = afterResult.modifiedResult;
+                                    }
+                                }
+                                const toolDuration = toolTimer.end();
+                                this.eventBus.emit('tool:after', {
+                                    toolName: toolCall.name,
+                                    args: toolCall.input,
+                                    result: result.output,
+                                    duration: toolDuration,
+                                    sessionId: session.sessionId,
                                 });
-                                toolTimer.end();
-                                performanceMonitor.recordToolExecution(toolTimer.end());
+                                performanceMonitor.recordToolExecution(toolDuration);
                                 this.approvalManager.updateExecutionResult(toolCall.id, {
                                     success: result.success,
                                     output: result.output,
@@ -1132,15 +1318,6 @@ If there's nothing noteworthy, respond with an empty string.`,
                     };
                     break;
                 }
-            }
-            if (iteration >= maxIterations) {
-                logger.warn('Tool loop exceeded max iterations');
-                onStream('', 'Tool execution loop exceeded maximum iterations', true);
-                finalResponse = {
-                    type: 'error',
-                    content: 'Tool execution loop exceeded maximum iterations',
-                    error: { code: 'MAX_ITERATIONS', message: 'Too many tool calls' },
-                };
             }
             // Record performance
             const requestDuration = requestTimer.end();
@@ -1533,6 +1710,83 @@ If there's nothing noteworthy, respond with an empty string.`,
         });
     }
     /**
+     * Build user message content, converting attachments to multimodal content blocks
+     */
+    async buildUserContent(message, attachments) {
+        if (!attachments?.length)
+            return message;
+        const contentBlocks = [];
+        if (message) {
+            contentBlocks.push({ type: 'text', text: message });
+        }
+        for (const att of attachments) {
+            if (att.type === 'image') {
+                if (att.url) {
+                    // Remote URL — store as url source; ModelAPI converter handles format differences
+                    contentBlocks.push({
+                        type: 'image',
+                        source: {
+                            type: 'url',
+                            media_type: att.mimeType || 'image/jpeg',
+                            data: att.url,
+                        },
+                    });
+                }
+                else if (att.localPath) {
+                    // Local file — read as base64
+                    try {
+                        const base64Data = await this.readFileAsBase64(att.localPath);
+                        if (base64Data) {
+                            contentBlocks.push({
+                                type: 'image',
+                                source: {
+                                    type: 'base64',
+                                    media_type: att.mimeType || 'image/jpeg',
+                                    data: base64Data,
+                                },
+                            });
+                        }
+                        else {
+                            contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.localPath} (failed to read)]` });
+                        }
+                    }
+                    catch (err) {
+                        logger.warn('[AgentManager] Failed to read image file:', err);
+                        contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.localPath} (error)]` });
+                    }
+                }
+            }
+            else {
+                // Non-image files (video, audio, file) — degrade to text description
+                contentBlocks.push({
+                    type: 'file',
+                    source: {
+                        type: 'url',
+                        url: att.url || att.localPath,
+                        filename: att.filename,
+                        mimeType: att.mimeType,
+                    },
+                });
+            }
+        }
+        return contentBlocks.length > 0 ? contentBlocks : message;
+    }
+    /**
+     * Read a local file as base64 string (uses Anode FileAPI)
+     */
+    async readFileAsBase64(path) {
+        try {
+            // Use Node.js fs for reading binary files
+            const fs = await import('fs/promises');
+            const buffer = await fs.readFile(path);
+            return buffer.toString('base64');
+        }
+        catch (error) {
+            logger.warn(`[AgentManager] Failed to read file as base64: ${path}`, error);
+            return null;
+        }
+    }
+    /**
      * Convert MediaAttachments to SocialAttachments for platform sending
      */
     convertToSocialAttachments(attachments) {
@@ -1551,20 +1805,30 @@ If there's nothing noteworthy, respond with an empty string.`,
     async handleSocialMessage(message) {
         const chatKey = `${message.platform}:${message.chatId}`;
         try {
-            // Skip empty messages
-            if (!message.text || message.text.trim() === '') {
+            // Skip messages with no text and no attachments
+            if ((!message.text || message.text.trim() === '') && !message.attachments?.length) {
                 logger.debug(`[Social] Ignoring empty message from ${chatKey}`);
                 return;
             }
             // Check for approval commands (/approve or /deny)
-            if (message.text.startsWith('/approve ') || message.text.startsWith('/deny ')) {
+            if (message.text?.startsWith('/approve ') || message.text?.startsWith('/deny ')) {
                 const handled = this.approvalManager.handleApprovalCommand(message);
                 if (handled) {
                     logger.info(`[Social] Handled approval command from ${message.username}`);
                     return;
                 }
             }
-            logger.info(`[Social] Message from ${message.platform}/${message.username}: ${message.text.substring(0, 80)}`);
+            logger.info(`[Social] Message from ${message.platform}/${message.username}: ${(message.text || '').substring(0, 80)}${message.attachments?.length ? ` [+${message.attachments.length} attachments]` : ''}`);
+            // Convert SocialAttachment[] → MediaAttachment[]
+            const incomingAttachments = message.attachments?.map(att => ({
+                type: att.type,
+                localPath: '',
+                url: att.url,
+                filename: att.filename,
+                mimeType: att.mimeType,
+            }));
+            // Allow media-only messages (no text but has attachments)
+            const messageText = message.text || (incomingAttachments?.length ? '' : '');
             // Get or create session for this chat
             let sessionId = this.socialSessions.get(chatKey);
             if (!sessionId) {
@@ -1593,7 +1857,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 }
                 if (sentMessageId) {
                     // Use streaming with periodic message edits
-                    const response = await this.sendMessageWithStreaming(sessionId, message.text, async (delta, accumulated, done) => {
+                    const response = await this.sendMessageWithStreaming(sessionId, messageText, async (delta, accumulated, done) => {
                         const now = Date.now();
                         // Throttle updates to avoid rate limits
                         if (done || (now - lastUpdateTime >= UPDATE_INTERVAL && accumulated.length > 0)) {
@@ -1610,7 +1874,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                                 logger.debug('[Social] Message edit failed:', err);
                             }
                         }
-                    });
+                    }, incomingAttachments);
                     // Log completion
                     if (response.type === 'text') {
                         logger.info(`[Social] Replied (streaming) to ${chatKey}: ${response.content.substring(0, 80)}`);
@@ -1627,7 +1891,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 }
                 else {
                     // Fallback: non-streaming
-                    const response = await this.sendMessage(sessionId, message.text);
+                    const response = await this.sendMessage(sessionId, messageText, incomingAttachments);
                     if (response.type === 'text' && response.content) {
                         await this.socialManager.sendMessage(message.platform, {
                             chatId: message.chatId,
@@ -1648,7 +1912,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             }
             else {
                 // Non-streaming mode
-                const response = await this.sendMessage(sessionId, message.text);
+                const response = await this.sendMessage(sessionId, messageText, incomingAttachments);
                 if (response.type === 'text' && response.content) {
                     await this.socialManager.sendMessage(message.platform, {
                         chatId: message.chatId,
@@ -1784,6 +2048,69 @@ If there's nothing noteworthy, respond with an empty string.`,
     async listAllSessions() {
         return FileSessionStorage.listSessions(this.config.storage.sessionDir);
     }
+    // ===== Tool Hooks =====
+    /**
+     * Register default tool hooks (memory-logger, screenshot-ocr hint)
+     */
+    registerDefaultToolHooks() {
+        // After-hook: log tool executions to DailyLog
+        this.toolHooksManager.onAfterToolCall('memory-logger', async (ctx) => {
+            try {
+                await this.dailyLogManager.logInsight(`Tool: ${ctx.toolName} (${ctx.duration}ms) → ${ctx.isError ? 'error' : 'ok'}`);
+            }
+            catch (err) {
+                logger.debug('[ToolHook:memory-logger] Failed to log:', err);
+            }
+        }, 0);
+        // After-hook: screenshot-ocr hint — append OCR suggestion when screenshot is taken
+        this.toolHooksManager.onAfterToolCall('screenshot-ocr-hint', async (ctx) => {
+            if ((ctx.toolName === 'android_screenshot' || ctx.toolName === 'android_take_screenshot') &&
+                !ctx.isError) {
+                return {
+                    metadata: {
+                        hint: 'Screenshot taken. Consider using ocr_recognize_screen to read the screen content.',
+                    },
+                };
+            }
+            return undefined;
+        }, -10);
+        const counts = this.toolHooksManager.getHookCounts();
+        logger.info(`[AgentManager] Registered ${counts.before} before hooks, ${counts.after} after hooks`);
+    }
+    // ===== EventBus Consumers =====
+    /**
+     * Register EventBus consumers for cross-system coordination
+     */
+    registerEventBusConsumers() {
+        // tool:after → log to DailyLog
+        this.eventBus.on('tool:after', async (data) => {
+            try {
+                await this.dailyLogManager.logInsight(`Tool: ${data.toolName} (${data.duration}ms)`);
+            }
+            catch (err) {
+                // silent
+            }
+        });
+        // session:compress → log compression event
+        this.eventBus.on('session:compress', async (data) => {
+            try {
+                await this.dailyLogManager.logInsight(`Context compressed: ${data.beforeCount} → ${data.afterCount} messages (session ${data.sessionId.slice(0, 8)})`);
+            }
+            catch (err) {
+                // silent
+            }
+        });
+        // memory:saved → log memory event
+        this.eventBus.on('memory:saved', async (data) => {
+            try {
+                await this.dailyLogManager.logInsight(`Memory saved: "${data.title}" [${data.tags.join(', ')}]`);
+            }
+            catch (err) {
+                // silent
+            }
+        });
+        logger.info('[AgentManager] EventBus consumers registered');
+    }
     // ===== Shutdown =====
     /**
      * Graceful shutdown of all systems
@@ -1795,6 +2122,8 @@ If there's nothing noteworthy, respond with an empty string.`,
         this.promptBuilder.destroy();
         this.subAgentCoordinator.removeAllListeners();
         this.proactiveBehavior.removeAllListeners();
+        this.toolHooksManager.clear();
+        this.eventBus.removeAllListeners();
         await this.pluginRegistry.destroyAll();
         logger.info('AgentManager shutdown complete');
     }
