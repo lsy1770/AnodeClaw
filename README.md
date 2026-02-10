@@ -5,7 +5,7 @@
 <h1 align="center">Anode ClawdBot</h1>
 
 <p align="center">
-  <strong>Android AI Agent System powered by Claude, running on ACS platform with Javet Node.js engine.</strong>
+  <strong>Android AI Agent System , running on ACS platform with Javet Node.js engine.</strong>
 </p>
 
 <p align="center">
