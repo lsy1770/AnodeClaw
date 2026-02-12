@@ -1,16 +1,17 @@
 /**
  * Chat Window - Main conversation interface
  *
- * Floating window-based chat interface for user interactions
+ * Floating window-based chat interface with embedded session list and settings panels.
+ * All panels share a single floatingWindow instance to avoid conflicts.
  */
 
 import type { AgentManager } from '../core/AgentManager.js';
-import type { MessageDisplay } from './types.js';
-import { createMessageBubble, createMediaCard, createThinkingIndicator, generateViewId } from './utils.js';
+import type { Config } from '../config/schema.js';
+import type { MessageDisplay, SessionInfo } from './types.js';
+import { createMessageBubble, createThinkingIndicator, createSessionListItem, generateViewId, escapeXml, formatTimestamp } from './utils.js';
 import { logger } from '../utils/logger.js';
 
 // Declare global FloatingWindowAPI
-// Actual signature: on(viewId, eventType, callback) — matches NotificationManager pattern
 declare const floatingWindow: {
   create(layoutXml: string): any;
   show(): void;
@@ -22,12 +23,17 @@ declare const floatingWindow: {
   setTouchable(touchable: boolean): void;
   isCreated(): boolean;
   addView(xmlString: string): any;
+  addViewToParent(parentId: string, xmlString: string): any; // 🆕 新增方法
   removeView(viewId: string): any;
   findView(id: string): any | null;
   setText(view: any, text: string): void;
   getText(view: any): string;
-  on(eventType: string, callback: (event: any) => void): boolean;
+  // 🔑 Updated: on() takes 3 parameters (viewId, eventType, callback)
+  on(viewId: string, eventType: string, callback: (event: any) => void): boolean;
+  // onView is an alias for on()
   onView(viewId: string, eventType: string, callback: (event: any) => void): boolean;
+  // onWindow is for window-level events (show, hide, close, etc.)
+  onWindow(eventType: string, callback: (event: any) => void): boolean;
 };
 
 /**
@@ -40,23 +46,30 @@ export interface ChatWindowConfig {
   height?: number;
 }
 
+/** Active panel in the floating window */
+type ActivePanel = 'chat' | 'sessions' | 'settings';
+
 /**
  * Chat Window Class
  *
- * Main UI component for AI conversation
+ * Main UI component for AI conversation with embedded session list and settings panels.
+ * Uses a single floatingWindow instance — panels are toggled via visibility.
  */
 export class ChatWindow {
   private agentManager: AgentManager;
+  private config: Config;
   private currentSessionId: string | null = null;
   private isVisible: boolean = false;
   private messageViewIds: string[] = [];
+  private sessionItemViewIds: string[] = [];
+  private activePanel: ActivePanel = 'chat';
 
-  // Event handlers
-  private onSessionChangeCallback?: (sessionId: string) => void;
-  private onSettingsCallback?: () => void;
+  // Callback for config save (back to ControlPanel)
+  private onConfigSaveCallback?: (config: Config) => void;
 
-  constructor(agentManager: AgentManager) {
+  constructor(agentManager: AgentManager, config: Config) {
     this.agentManager = agentManager;
+    this.config = config;
   }
 
   /**
@@ -65,71 +78,52 @@ export class ChatWindow {
   async show(config: ChatWindowConfig = {}): Promise<void> {
     if (this.isVisible) {
       logger.debug('Chat window already visible');
+      floatingWindow.show();
       return;
     }
 
     const xml = this.createMainLayout();
 
-    // Create floating window with correct API pattern
     floatingWindow.create(xml);
     floatingWindow.setSize(config.width ?? 700, config.height ?? 1000);
     floatingWindow.setPosition(config.x ?? 50, config.y ?? 100);
     floatingWindow.setTouchable(true);
-    // Don't set focusable here - let the click handler manage it for keyboard
 
-    // Setup event listeners
     this.setupEventListeners();
 
-    // Show window (no parameters)
     floatingWindow.show();
     this.isVisible = true;
 
-    // Initialize session
     await this.initializeSession();
 
     logger.info('Chat window shown');
   }
 
   /**
-   * Hide the chat window
+   * Hide the chat window (keeps state)
    */
   hide(): void {
-    if (!this.isVisible) {
-      return;
-    }
-
+    if (!this.isVisible) return;
     floatingWindow.hide();
     this.isVisible = false;
-
     logger.info('Chat window hidden');
   }
 
   /**
-   * Close the chat window
+   * Close the chat window (destroys state)
    */
   close(): void {
-    if (!this.isVisible) {
-      return;
-    }
-
+    if (!this.isVisible) return;
     floatingWindow.close();
     this.isVisible = false;
-
     logger.info('Chat window closed');
   }
 
   /**
-   * Set session change callback
+   * Set callback for when config is saved from settings panel
    */
-  onSessionChange(callback: (sessionId: string) => void): void {
-    this.onSessionChangeCallback = callback;
-  }
-
-  /**
-   * Set settings callback
-   */
-  onSettings(callback: () => void): void {
-    this.onSettingsCallback = callback;
+  onConfigSave(callback: (config: Config) => void): void {
+    this.onConfigSaveCallback = callback;
   }
 
   /**
@@ -144,171 +138,486 @@ export class ChatWindow {
    */
   async switchSession(sessionId: string): Promise<void> {
     this.currentSessionId = sessionId;
-
-    // Clear current messages
     this.clearMessages();
-
-    // Load session history
     await this.loadSessionHistory();
-
+    this.showPanel('chat');
     logger.info(`Switched to session: ${sessionId}`);
   }
 
+  // ==================================================
+  // Panel switching — uses View.setVisibility()
+  // ==================================================
+
   /**
-   * Create main layout XML
+   * Switch to the specified panel.
+   * View.VISIBLE = 0, View.GONE = 8
    */
-  private createMainLayout(): string {
-    return `<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="#CC1E1E1E">
+  private showPanel(panel: ActivePanel): void {
+    this.activePanel = panel;
+    const panels: Record<ActivePanel, string> = {
+      chat: 'chat_panel',
+      sessions: 'session_panel',
+      settings: 'settings_panel',
+    };
 
-    <!-- Top Toolbar -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="44dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:background="#DD2A2A2A"
-        android:paddingStart="12dp"
-        android:paddingEnd="8dp">
+    for (const [key, viewId] of Object.entries(panels)) {
+      const view = floatingWindow.findView(viewId);
+      if (view && typeof view.setVisibility === 'function') {
+        view.setVisibility(key === panel ? 0 : 8);
+      }
+    }
 
-        <TextView
-            android:id="@+id/title"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Anode ClawdBot"
-            android:textSize="14sp"
-            android:textColor="#80CBC4"
-            android:textStyle="bold"/>
-
-        <Button
-            android:id="@+id/btn_sessions"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:text="📋"
-            android:textSize="16sp"
-            android:textColor="#EAEAEA"
-            android:background="#00000000"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:padding="0dp"/>
-
-        <Button
-            android:id="@+id/btn_settings"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:text="⚙️"
-            android:textSize="16sp"
-            android:textColor="#EAEAEA"
-            android:background="#00000000"
-            android:layout_marginStart="2dp"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:padding="0dp"/>
-
-        <Button
-            android:id="@+id/btn_close"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:text="✕"
-            android:textSize="16sp"
-            android:textColor="#EAEAEA"
-            android:background="#00000000"
-            android:layout_marginStart="2dp"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:padding="0dp"/>
-    </LinearLayout>
-
-    <!-- Message ScrollView -->
-    <ScrollView
-        android:id="@+id/scroll_messages"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:padding="12dp"
-        android:background="#00000000"
-        android:scrollbars="vertical">
-
-        <LinearLayout
-            android:id="@+id/messages_container"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"/>
-    </ScrollView>
-
-    <!-- Input Area -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="8dp"
-        android:background="#CC303030"
-        android:gravity="center_vertical">
-
-        <EditText
-            android:id="@+id/input_message"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="输入消息..."
-            android:textColor="#EAEAEA"
-            android:textColorHint="#888888"
-            android:padding="12dp"
-            android:maxLines="4"
-            android:inputType="textMultiLine"
-            android:background="#CC3E3E3E"/>
-
-        <Button
-            android:id="@+id/btn_send"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="发送"
-            android:textColor="#80CBC4"
-            android:background="#00000000"
-            android:layout_marginStart="8dp"/>
-    </LinearLayout>
-</LinearLayout>`;
+    // Populate panel data when switching to it
+    if (panel === 'sessions') {
+      this.populateSessionList();
+    } else if (panel === 'settings') {
+      this.populateSettings();
+    }
   }
 
-  /**
-   * Setup event listeners
-   */
+  // ==================================================
+  // Layout
+  // ==================================================
+
+  private createMainLayout(): string {
+    return `<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- ===== Chat Panel (default visible) ===== -->
+    <LinearLayout
+        android:id="@+id/chat_panel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="#CC1E1E1E"
+        android:visibility="visible">
+
+        <!-- Chat Toolbar -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#DD2A2A2A"
+            android:paddingStart="12dp"
+            android:paddingEnd="8dp">
+
+            <TextView
+                android:id="@+id/title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Anode ClawdBot"
+                android:textSize="14sp"
+                android:textColor="#80CBC4"
+                android:textStyle="bold"/>
+
+            <Button
+                android:id="@+id/btn_sessions"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="📋"
+                android:textSize="16sp"
+                android:textColor="#EAEAEA"
+                android:background="#00000000"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"/>
+
+            <Button
+                android:id="@+id/btn_settings"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="⚙️"
+                android:textSize="16sp"
+                android:textColor="#EAEAEA"
+                android:background="#00000000"
+                android:layout_marginStart="2dp"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"/>
+
+            <Button
+                android:id="@+id/btn_close"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="✕"
+                android:textSize="16sp"
+                android:textColor="#EAEAEA"
+                android:background="#00000000"
+                android:layout_marginStart="2dp"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"/>
+        </LinearLayout>
+
+        <!-- Message ScrollView -->
+        <ScrollView
+            android:id="@+id/scroll_messages"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:padding="12dp"
+            android:background="#00000000"
+            android:scrollbars="vertical">
+
+            <LinearLayout
+                android:id="@+id/messages_container"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"/>
+        </ScrollView>
+
+        <!-- Input Area -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="8dp"
+            android:background="#CC303030"
+            android:gravity="center_vertical">
+
+            <EditText
+                android:id="@+id/input_message"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="输入消息..."
+                android:textColor="#EAEAEA"
+                android:textColorHint="#888888"
+                android:padding="12dp"
+                android:maxLines="4"
+                android:inputType="textMultiLine"
+                android:background="#CC3E3E3E"/>
+
+            <Button
+                android:id="@+id/btn_send"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="发送"
+                android:textColor="#80CBC4"
+                android:background="#00000000"
+                android:layout_marginStart="8dp"/>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ===== Session List Panel (hidden) ===== -->
+    <LinearLayout
+        android:id="@+id/session_panel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="#CC1E1E1E"
+        android:visibility="gone">
+
+        <!-- Session Toolbar -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#DD2A2A2A"
+            android:paddingStart="12dp"
+            android:paddingEnd="8dp">
+
+            <Button
+                android:id="@+id/btn_back_sessions"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="←"
+                android:textSize="18sp"
+                android:textColor="#EAEAEA"
+                android:background="#00000000"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"/>
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="会话列表"
+                android:textSize="14sp"
+                android:textColor="#80CBC4"
+                android:textStyle="bold"
+                android:layout_marginStart="8dp"/>
+
+            <Button
+                android:id="@+id/btn_new_session"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="＋"
+                android:textSize="18sp"
+                android:textColor="#EAEAEA"
+                android:background="#00000000"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"/>
+        </LinearLayout>
+
+        <!-- Session List -->
+        <ScrollView
+            android:id="@+id/scroll_sessions"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:scrollbars="vertical">
+
+            <LinearLayout
+                android:id="@+id/session_list_container"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"/>
+        </ScrollView>
+
+        <!-- Empty state -->
+        <LinearLayout
+            android:id="@+id/session_empty_state"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="暂无会话"
+                android:textSize="16sp"
+                android:textColor="#AAAAAA"/>
+
+            <Button
+                android:id="@+id/btn_create_first"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="创建新会话"
+                android:textColor="#80CBC4"
+                android:background="#00000000"
+                android:layout_marginTop="16dp"/>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ===== Settings Panel (hidden) ===== -->
+    <LinearLayout
+        android:id="@+id/settings_panel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="#CC1E1E1E"
+        android:visibility="gone">
+
+        <!-- Settings Toolbar -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#DD2A2A2A"
+            android:paddingStart="12dp"
+            android:paddingEnd="8dp">
+
+            <Button
+                android:id="@+id/btn_back_settings"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="←"
+                android:textSize="18sp"
+                android:textColor="#EAEAEA"
+                android:background="#00000000"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"/>
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="设置"
+                android:textSize="14sp"
+                android:textColor="#80CBC4"
+                android:textStyle="bold"
+                android:layout_marginStart="8dp"/>
+
+            <Button
+                android:id="@+id/btn_save_settings"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="保存"
+                android:textSize="14sp"
+                android:textColor="#80CBC4"
+                android:background="#00000000"
+                android:minWidth="0dp"
+                android:minHeight="0dp"/>
+        </LinearLayout>
+
+        <!-- Settings Content -->
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:padding="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <!-- Model Settings -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="模型设置"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:textColor="#80CBC4"
+                    android:layout_marginBottom="8dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="AI 提供商"
+                    android:textSize="14sp"
+                    android:textColor="#AAAAAA"
+                    android:layout_marginTop="8dp"/>
+                <TextView
+                    android:id="@+id/settings_provider"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text=""
+                    android:textSize="14sp"
+                    android:textColor="#EAEAEA"
+                    android:padding="12dp"
+                    android:background="#CC303030"
+                    android:layout_marginTop="4dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="模型"
+                    android:textSize="14sp"
+                    android:textColor="#AAAAAA"
+                    android:layout_marginTop="16dp"/>
+                <EditText
+                    android:id="@+id/settings_model"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="模型名称"
+                    android:textColor="#EAEAEA"
+                    android:textColorHint="#888888"
+                    android:inputType="text"
+                    android:background="#CC303030"
+                    android:padding="12dp"
+                    android:layout_marginTop="4dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="最大 Token 数"
+                    android:textSize="14sp"
+                    android:textColor="#AAAAAA"
+                    android:layout_marginTop="16dp"/>
+                <EditText
+                    android:id="@+id/settings_max_tokens"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="8192"
+                    android:textColor="#EAEAEA"
+                    android:textColorHint="#888888"
+                    android:inputType="number"
+                    android:background="#CC303030"
+                    android:padding="12dp"
+                    android:layout_marginTop="4dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Temperature"
+                    android:textSize="14sp"
+                    android:textColor="#AAAAAA"
+                    android:layout_marginTop="16dp"/>
+                <EditText
+                    android:id="@+id/settings_temperature"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="1.0"
+                    android:textColor="#EAEAEA"
+                    android:textColorHint="#888888"
+                    android:inputType="numberDecimal"
+                    android:background="#CC303030"
+                    android:padding="12dp"
+                    android:layout_marginTop="4dp"/>
+
+                <!-- Divider -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="#444444"
+                    android:layout_marginTop="24dp"
+                    android:layout_marginBottom="16dp"/>
+
+                <!-- About -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="关于"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:textColor="#80CBC4"
+                    android:layout_marginBottom="8dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Anode ClawdBot v0.2.0"
+                    android:textSize="14sp"
+                    android:textColor="#AAAAAA"
+                    android:layout_marginTop="8dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Android AI Agent System"
+                    android:textSize="14sp"
+                    android:textColor="#AAAAAA"
+                    android:layout_marginTop="4dp"/>
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+
+</FrameLayout>`;
+  }
+
+  // ==================================================
+  // Event listeners
+  // ==================================================
+
   private setupEventListeners(): void {
-    // Use onView for per-button click handlers
-    const sendSuccess = floatingWindow.onView('btn_send', 'click', () => {
+    logger.debug('[ChatWindow] Setting up event listeners');
+
+    // --- Chat panel ---
+    floatingWindow.on('btn_send', 'click', () => {
       logger.debug('[ChatWindow] btn_send clicked');
       this.handleSendMessage();
     });
-    logger.debug(`[ChatWindow] btn_send listener: ${sendSuccess}`);
 
-    const closeSuccess = floatingWindow.onView('btn_close', 'click', () => {
+    floatingWindow.on('btn_close', 'click', () => {
       logger.debug('[ChatWindow] btn_close clicked');
       this.hide();
     });
-    logger.debug(`[ChatWindow] btn_close listener: ${closeSuccess}`);
 
-    const sessionsSuccess = floatingWindow.onView('btn_sessions', 'click', () => {
-      logger.info('[ChatWindow] btn_sessions clicked');
-      if (this.onSessionChangeCallback) {
-        this.onSessionChangeCallback(this.currentSessionId!);
-      }
+    floatingWindow.on('btn_sessions', 'click', () => {
+      logger.info('[ChatWindow] btn_sessions clicked → show session panel');
+      this.showPanel('sessions');
     });
-    logger.debug(`[ChatWindow] btn_sessions listener: ${sessionsSuccess}`);
 
-    const settingsSuccess = floatingWindow.onView('btn_settings', 'click', () => {
-      logger.info('[ChatWindow] btn_settings clicked');
-      if (this.onSettingsCallback) {
-        this.onSettingsCallback();
-      }
+    floatingWindow.on('btn_settings', 'click', () => {
+      logger.info('[ChatWindow] btn_settings clicked → show settings panel');
+      this.showPanel('settings');
     });
-    logger.debug(`[ChatWindow] btn_settings listener: ${settingsSuccess}`);
 
-    // Input field: toggle focusable on tap so keyboard can open
-    floatingWindow.onView('input_message', 'click', () => {
+    floatingWindow.on('input_message', 'click', () => {
       floatingWindow.setFocusable(true);
       try {
         const inputView = floatingWindow.findView('input_message');
@@ -320,21 +629,50 @@ export class ChatWindow {
       }
     });
 
-    // Editor action (Enter key) on input
-    floatingWindow.onView('input_message', 'editorAction', (event: any) => {
-      if (event.actionId === 6) {
-        // IME_ACTION_DONE
+    // 🔑 使用 editorAction 事件处理 Enter 键发送
+    floatingWindow.on('input_message', 'editorAction', (event: any) => {
+      logger.debug('[ChatWindow] editorAction:', event);
+      if (event?.actionId === 6) { // IME_ACTION_DONE
         this.handleSendMessage();
       }
     });
+
+    // --- Session panel ---
+    floatingWindow.on('btn_back_sessions', 'click', () => {
+      logger.debug('[ChatWindow] btn_back_sessions clicked');
+      this.showPanel('chat');
+    });
+
+    floatingWindow.on('btn_new_session', 'click', () => {
+      logger.info('[ChatWindow] btn_new_session clicked');
+      this.handleNewSession();
+    });
+
+    floatingWindow.on('btn_create_first', 'click', () => {
+      logger.info('[ChatWindow] btn_create_first clicked');
+      this.handleNewSession();
+    });
+
+    // --- Settings panel ---
+    floatingWindow.on('btn_back_settings', 'click', () => {
+      logger.debug('[ChatWindow] btn_back_settings clicked');
+      this.showPanel('chat');
+    });
+
+    floatingWindow.on('btn_save_settings', 'click', () => {
+      logger.info('[ChatWindow] btn_save_settings clicked');
+      this.handleSaveSettings();
+    });
+
+    logger.debug('[ChatWindow] Event listeners setup complete');
   }
 
-  /**
-   * Handle send message
-   */
+  // ==================================================
+  // Chat operations
+  // ==================================================
+
   private async handleSendMessage(): Promise<void> {
     try {
-      // Get input text using findView + getText pattern
       const inputView = floatingWindow.findView('input_message');
       if (!inputView) {
         logger.error('Input view not found');
@@ -342,17 +680,11 @@ export class ChatWindow {
       }
 
       const message = floatingWindow.getText(inputView);
-      if (!message || message.trim() === '') {
-        return;
-      }
+      if (!message || message.trim() === '') return;
 
-      // Clear input using findView + setText pattern
       floatingWindow.setText(inputView, '');
-
-      // Release focus back to underlying app after sending
       floatingWindow.setFocusable(false);
 
-      // Display user message
       this.appendMessage({
         id: generateViewId(),
         role: 'user',
@@ -360,21 +692,17 @@ export class ChatWindow {
         timestamp: Date.now(),
       });
 
-      // Show thinking indicator
       const thinkingId = generateViewId();
       this.appendThinking(thinkingId);
 
       try {
-        // Send to agent
         const response = await this.agentManager.sendMessage(
           this.currentSessionId!,
           message
         );
 
-        // Remove thinking indicator
         this.removeThinking(thinkingId);
 
-        // Display AI response
         this.appendMessage({
           id: generateViewId(),
           role: 'assistant',
@@ -383,7 +711,6 @@ export class ChatWindow {
           attachments: response.attachments,
         });
 
-        // Scroll to bottom
         this.scrollToBottom();
       } catch (error) {
         this.removeThinking(thinkingId);
@@ -399,99 +726,68 @@ export class ChatWindow {
     }
   }
 
-  /**
-   * Append message to UI
-   */
   private appendMessage(message: MessageDisplay): void {
     const messageBubble = createMessageBubble({
       role: message.role,
       content: message.content,
     }, message.id, message.attachments);
 
-    // Track message view IDs for clearMessages
     this.messageViewIds.push(message.id);
 
-    // Use addView instead of appendView
-    floatingWindow.addView(messageBubble);
+    // 🔑 使用 addViewToParent 将消息添加到 messages_container
+    floatingWindow.addViewToParent('messages_container', messageBubble);
+    logger.debug(`[ChatWindow] Message ${message.id} added to messages_container`);
   }
 
-  /**
-   * Append thinking indicator
-   */
   private appendThinking(indicatorId: string): void {
-    const indicator = createThinkingIndicator(indicatorId);
-    // Use addView instead of appendView
-    floatingWindow.addView(indicator);
+    floatingWindow.addViewToParent('messages_container', createThinkingIndicator(indicatorId));
+    logger.debug(`[ChatWindow] Thinking indicator ${indicatorId} added`);
   }
 
-  /**
-   * Remove thinking indicator
-   */
   private removeThinking(indicatorId: string): void {
     floatingWindow.removeView(indicatorId);
   }
 
-  /**
-   * Clear all messages
-   */
   private clearMessages(): void {
     for (const viewId of this.messageViewIds) {
-      try {
-        floatingWindow.removeView(viewId);
-      } catch (error) {
-        logger.debug(`Failed to remove message view ${viewId}:`, error);
-      }
+      try { floatingWindow.removeView(viewId); } catch (_) {}
     }
     this.messageViewIds = [];
-    logger.debug('Messages cleared');
   }
 
-  /**
-   * Scroll to bottom
-   */
   private scrollToBottom(): void {
     try {
       const scrollView = floatingWindow.findView('scroll_messages');
       if (scrollView && scrollView.fullScroll) {
-        // View.FOCUS_DOWN = 130
-        scrollView.fullScroll(130);
+        scrollView.fullScroll(130); // View.FOCUS_DOWN
       }
     } catch (error) {
-      logger.debug('ScrollToBottom not supported or failed:', error);
+      logger.debug('ScrollToBottom failed:', error);
     }
   }
 
-  /**
-   * Initialize session
-   */
+  // ==================================================
+  // Session operations (embedded)
+  // ==================================================
+
   private async initializeSession(): Promise<void> {
     try {
-      // Try to load most recent session or create new one
       const activeSessions = this.agentManager.getActiveSessions();
-
       if (activeSessions.length > 0) {
-        // Use the first active session
         this.currentSessionId = activeSessions[0];
         await this.loadSessionHistory();
       } else {
-        // Create new session
         const session = await this.agentManager.createSession({});
         this.currentSessionId = session.sessionId;
       }
-
       logger.info(`Initialized with session: ${this.currentSessionId}`);
     } catch (error) {
       logger.error('Error initializing session:', error);
     }
   }
 
-  /**
-   * Load session history
-   */
   private async loadSessionHistory(): Promise<void> {
-    if (!this.currentSessionId) {
-      return;
-    }
+    if (!this.currentSessionId) return;
 
     try {
       const session = this.agentManager.getSession(this.currentSessionId);
@@ -500,15 +796,9 @@ export class ChatWindow {
         return;
       }
 
-      // Get message tree
       const context = session.buildContext();
-
-      // Display messages (skip system message)
       for (const msg of context) {
-        if (msg.role === 'system') {
-          continue;
-        }
-
+        if (msg.role === 'system') continue;
         if (msg.role === 'user' || msg.role === 'assistant') {
           this.appendMessage({
             id: generateViewId(),
@@ -519,10 +809,220 @@ export class ChatWindow {
           });
         }
       }
-
       this.scrollToBottom();
     } catch (error) {
       logger.error('Error loading session history:', error);
+    }
+  }
+
+  private async handleNewSession(): Promise<void> {
+    try {
+      const session = await this.agentManager.createSession({});
+      this.currentSessionId = session.sessionId;
+      this.clearMessages();
+      this.showPanel('chat');
+      logger.info(`New session created: ${session.sessionId}`);
+    } catch (error) {
+      logger.error('Error creating new session:', error);
+    }
+  }
+
+  /**
+   * Populate the embedded session list panel with current sessions
+   */
+  private populateSessionList(): void {
+    // Clear previous session items
+    for (const viewId of this.sessionItemViewIds) {
+      try { floatingWindow.removeView(viewId); } catch (_) {}
+    }
+    this.sessionItemViewIds = [];
+
+    try {
+      const sessionIds = this.agentManager.getActiveSessions();
+
+      if (sessionIds.length === 0) {
+        // Show empty state, hide list
+        const emptyView = floatingWindow.findView('session_empty_state');
+        const listView = floatingWindow.findView('scroll_sessions');
+        if (emptyView) emptyView.setVisibility(0);
+        if (listView) listView.setVisibility(8);
+        return;
+      }
+
+      // Hide empty state, show list
+      const emptyView = floatingWindow.findView('session_empty_state');
+      const listView = floatingWindow.findView('scroll_sessions');
+      if (emptyView) emptyView.setVisibility(8);
+      if (listView) listView.setVisibility(0);
+
+      // Collect session info
+      const sessions: SessionInfo[] = [];
+      for (const sessionId of sessionIds) {
+        const session = this.agentManager.getSession(sessionId);
+        if (!session) continue;
+
+        let lastMessage = '';
+        let lastUpdated = Date.now();
+
+        const context = session.buildContext();
+        if (context.length > 0) {
+          const lastMsg = context[context.length - 1];
+          if (lastMsg && lastMsg.role !== 'system') {
+            lastMessage = typeof lastMsg.content === 'string'
+              ? lastMsg.content
+              : JSON.stringify(lastMsg.content);
+            lastUpdated = lastMsg.timestamp;
+          }
+        }
+
+        sessions.push({
+          sessionId,
+          title: `会话 ${sessionId.substring(0, 8)}`,
+          lastMessage,
+          lastUpdated,
+          messageCount: session.getMessageTree().size,
+        });
+      }
+
+      sessions.sort((a, b) => b.lastUpdated - a.lastUpdated);
+
+      // Add session items. Highlight the current session.
+      for (const s of sessions) {
+        const isCurrent = s.sessionId === this.currentSessionId;
+        const itemId = `session_${s.sessionId}`;
+        this.sessionItemViewIds.push(itemId);
+
+        const timeStr = formatTimestamp(s.lastUpdated);
+        const preview = s.lastMessage ? escapeXml(s.lastMessage.substring(0, 50)) : '暂无消息';
+        const bgColor = isCurrent ? '#CC37474F' : '#CC1E1E1E';
+
+        const itemXml = `
+<LinearLayout
+    android:id="${itemId}"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="${bgColor}"
+    android:clickable="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="${escapeXml(s.title)}"
+            android:textSize="16sp"
+            android:textColor="#EAEAEA"
+            android:textStyle="bold"/>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="${timeStr}"
+            android:textSize="12sp"
+            android:textColor="#AAAAAA"/>
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="${preview}"
+        android:textSize="14sp"
+        android:textColor="#AAAAAA"
+        android:layout_marginTop="4dp"
+        android:maxLines="2"
+        android:ellipsize="end"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#444444"
+        android:layout_marginTop="16dp"/>
+</LinearLayout>`;
+
+        floatingWindow.addViewToParent('session_list_container', itemXml);
+
+        // 🔑 为每个动态添加的 session item 注册点击事件
+        const sessionId = s.sessionId;
+        floatingWindow.on(itemId, 'click', () => {
+          logger.info(`[ChatWindow] Session item clicked: ${sessionId}`);
+          this.switchSession(sessionId);
+        });
+      }
+    } catch (error) {
+      logger.error('Error populating session list:', error);
+    }
+  }
+
+  // ==================================================
+  // Settings operations (embedded)
+  // ==================================================
+
+  /**
+   * Populate settings fields with current config values
+   */
+  private populateSettings(): void {
+    try {
+      const providerView = floatingWindow.findView('settings_provider');
+      if (providerView) {
+        floatingWindow.setText(providerView, this.config.model.provider || 'anthropic');
+      }
+
+      const modelView = floatingWindow.findView('settings_model');
+      if (modelView) {
+        floatingWindow.setText(modelView, this.config.model.model);
+      }
+
+      const maxTokensView = floatingWindow.findView('settings_max_tokens');
+      if (maxTokensView) {
+        floatingWindow.setText(maxTokensView, this.config.model.maxTokens.toString());
+      }
+
+      const tempView = floatingWindow.findView('settings_temperature');
+      if (tempView) {
+        floatingWindow.setText(tempView, this.config.model.temperature.toString());
+      }
+    } catch (error) {
+      logger.error('Error populating settings:', error);
+    }
+  }
+
+  /**
+   * Save settings from the embedded settings panel
+   */
+  private handleSaveSettings(): void {
+    try {
+      const modelView = floatingWindow.findView('settings_model');
+      const model = modelView ? floatingWindow.getText(modelView) : '';
+      if (model) this.config.model.model = model;
+
+      const maxTokensView = floatingWindow.findView('settings_max_tokens');
+      const maxTokensStr = maxTokensView ? floatingWindow.getText(maxTokensView) : '';
+      if (maxTokensStr) {
+        const maxTokens = parseInt(maxTokensStr, 10);
+        if (!isNaN(maxTokens) && maxTokens > 0) this.config.model.maxTokens = maxTokens;
+      }
+
+      const tempView = floatingWindow.findView('settings_temperature');
+      const tempStr = tempView ? floatingWindow.getText(tempView) : '';
+      if (tempStr) {
+        const temp = parseFloat(tempStr);
+        if (!isNaN(temp) && temp >= 0) this.config.model.temperature = temp;
+      }
+
+      if (this.onConfigSaveCallback) {
+        this.onConfigSaveCallback(this.config);
+      }
+
+      logger.info('Settings saved from floating window');
+      this.showPanel('chat');
+    } catch (error) {
+      logger.error('Error saving settings:', error);
     }
   }
 }

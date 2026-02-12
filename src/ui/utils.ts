@@ -137,7 +137,7 @@ export function createMessageBubble(
 
   return `
 <LinearLayout
-    android:id="@+id/${messageId}"
+    android:id="${messageId}"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
@@ -163,7 +163,7 @@ export function createMessageBubble(
 export function createThinkingIndicator(indicatorId: string): string {
   return `
 <LinearLayout
-    android:id="@+id/${indicatorId}"
+    android:id="${indicatorId}"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="horizontal"
@@ -196,7 +196,7 @@ export function createSessionListItem(session: {
 
   return `
 <LinearLayout
-    android:id="@+id/session_${session.sessionId}"
+    android:id="session_${session.sessionId}"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
@@ -235,7 +235,7 @@ export function createSessionListItem(session: {
         android:maxLines="2"
         android:ellipsize="end"/>
 
-    <View
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="1dp"
         android:background="#444444"

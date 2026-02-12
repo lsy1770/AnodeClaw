@@ -38,14 +38,43 @@ export class TokenCounter {
             tokens += this.estimateTokens(message.content);
         }
         else if (Array.isArray(message.content)) {
-            // Tool calls or results
-            tokens += this.estimateTokens(JSON.stringify(message.content));
+            tokens += this.estimateMultimodalTokens(message.content);
         }
         // Add role overhead
         tokens += 4;
-        // Add metadata overhead if present
+        // Add metadata overhead if present (exclude large binary fields)
         if (message.metadata) {
-            tokens += Math.ceil(JSON.stringify(message.metadata).length / this.CHARS_PER_TOKEN);
+            const metaCopy = { ...message.metadata };
+            delete metaCopy.attachments; // Don't count attachment metadata twice
+            tokens += Math.ceil(JSON.stringify(metaCopy).length / this.CHARS_PER_TOKEN);
+        }
+        return tokens;
+    }
+    /**
+     * Estimate tokens for multimodal content arrays.
+     * Handles image blocks with fixed per-image cost instead of stringifying base64 data.
+     */
+    static estimateMultimodalTokens(content) {
+        let tokens = 0;
+        for (const block of content) {
+            if (block.type === 'image') {
+                // Images have a fixed token cost in the API, regardless of base64 string length
+                tokens += this.TOKENS_PER_IMAGE;
+            }
+            else if (block.type === 'text') {
+                tokens += this.estimateTokens(block.text || '');
+            }
+            else if (block.type === 'tool_use' || block.type === 'tool_result') {
+                tokens += this.estimateTokens(JSON.stringify(block));
+            }
+            else if (block.type === 'file') {
+                // Files degrade to text descriptions, estimate a small overhead
+                tokens += 50;
+            }
+            else {
+                // Fallback: stringify other block types
+                tokens += this.estimateTokens(JSON.stringify(block));
+            }
         }
         return tokens;
     }
@@ -95,3 +124,5 @@ export class TokenCounter {
 // Approximate tokens per character ratio
 // Claude typically uses ~4 characters per token for English
 TokenCounter.CHARS_PER_TOKEN = 4;
+// Approximate token cost per image in the API (Anthropic charges ~1600 tokens for a typical image)
+TokenCounter.TOKENS_PER_IMAGE = 1600;

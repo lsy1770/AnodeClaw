@@ -44,10 +44,24 @@
     // Default system prompt
     defaultSystemPrompt: 'You are a helpful AI assistant running on an Android device. You have access to various tools to help users automate tasks and interact with their device. Always be concise and helpful.',
 
-    // Token count to show context warning (approaching limit)
+    // Model context window size (input token capacity, NOT response tokens)
+    // ⚠️ IMPORTANT: Set this to match your model's actual input limit
+    // Common limits:
+    //   - Claude Sonnet 4.5 / Haiku = 200000
+    //   - GPT-4 = 128000
+    //   - DeepSeek V3 = 170000 (use 169000 to be safe)
+    //   - Gemini 1.5 Pro = 2000000
+    // WARNING: This is NOT the same as model.maxTokens (which is the output limit)
+    contextWindow: 200000,
+
+    // Context window warning threshold (when to warn about approaching limit)
+    // Default 3500 is for tracking message count, not tokens
+    // Set to 0.7 * contextWindow for 70% token usage warning
     contextWindowWarning: 3500,
 
-    // Maximum context window size (tokens)
+    // Context window maximum (hard limit before compression)
+    // Should be less than contextWindow to ensure successful API calls
+    // Default 4000 is for message count tracking
     contextWindowMax: 4000,
 
     // Enable automatic context compression

@@ -10,9 +10,10 @@
  */
 import { Session } from './Session.js';
 import { FileSessionStorage } from './FileSessionStorage.js';
-import { ModelAPI, ModelAPIError } from './ModelAPI.js';
+import { ModelAPI, ModelAPIError, detectModelTokenLimit } from './ModelAPI.js';
 import { generateSessionId } from '../utils/id.js';
 import { logger } from '../utils/logger.js';
+import { generateId } from '../utils/id.js';
 import { ToolRegistry, ToolExecutor, builtinTools, setMemorySystem, setSubAgentCoordinator } from '../tools/index.js';
 import { LaneManager } from './lane/LaneManager.js';
 import { ContextWindowGuard } from './context/ContextWindowGuard.js';
@@ -61,8 +62,25 @@ export class AgentManager {
         // Initialize Lane Manager
         this.laneManager = new LaneManager();
         // Initialize Context Window Guard
+        // Use agent.contextWindow (model's input capacity), NOT model.maxTokens (response output limit)
+        let contextWindowTokens = config.agent.contextWindow || 200000;
+        // 🔑 Auto-detect model-specific token limit
+        const detectedLimit = detectModelTokenLimit(config.model.model);
+        if (detectedLimit !== 128000) { // Only use detected limit if it's not the default
+            logger.info(`[AgentManager] Detected model token limit: ${detectedLimit} (model: ${config.model.model})`);
+            contextWindowTokens = Math.min(contextWindowTokens, detectedLimit);
+        }
+        // Sanity check: contextWindow should be the model's input context, not the output maxTokens
+        // Common misconfiguration: setting contextWindow to the same value as model.maxTokens (e.g. 4096)
+        if (contextWindowTokens <= 10000) {
+            logger.warn(`[AgentManager] contextWindow is set to ${contextWindowTokens}, which seems too small. ` +
+                `This should be the model's INPUT context capacity (e.g. 200000 for Claude), NOT the output maxTokens. ` +
+                `Falling back to ${detectedLimit}. Check your config agent.contextWindow setting.`);
+            contextWindowTokens = detectedLimit;
+        }
+        logger.info(`[AgentManager] Context window guard: maxTokens=${contextWindowTokens}, model.maxTokens(output)=${config.model.maxTokens}`);
         this.contextGuard = new ContextWindowGuard({
-            maxTokens: config.model.maxTokens,
+            maxTokens: contextWindowTokens,
             warningThreshold: 0.7,
             compressionThreshold: 0.85,
             minMessagesToKeep: 10,
@@ -600,21 +618,21 @@ If there's nothing noteworthy, respond with an empty string.`,
                 session = await this.loadSession(sessionId);
             }
             logger.info(`Processing message for session: ${sessionId}`);
-            // Add user message (with multimodal content if attachments present)
+            // 🔑 关键修复：在添加用户消息**之前**检查上下文窗口
+            // 预估添加用户消息后的 token 数
             const userContent = await this.buildUserContent(message, attachments);
-            session.addMessage({
+            const tempUserMessage = {
+                id: generateId(), // 临时 ID，实际消息添加时会重新生成
                 role: 'user',
                 content: userContent,
-            });
-            // Log to memory system
-            this.memorySystem.appendLog(sessionId, {
                 timestamp: Date.now(),
-                role: 'user',
-                content: message,
-            }).catch(err => logger.debug('[Memory] Log append failed:', err));
-            // Check context window and auto-compress if needed
+                parentId: null,
+                children: [],
+            };
             const currentMessages = session.buildContext();
-            const contextStatus = this.contextGuard.checkStatus(currentMessages);
+            const messagesWithUser = [...currentMessages, tempUserMessage];
+            const contextStatus = this.contextGuard.checkStatus(messagesWithUser);
+            // 如果添加用户消息后会触发压缩，先压缩再添加
             if (contextStatus.needsCompression) {
                 // Pre-compression memory flush
                 const usageRatio = contextStatus.currentTokens / contextStatus.maxTokens;
@@ -629,14 +647,14 @@ If there's nothing noteworthy, respond with an empty string.`,
                             metadata: m.metadata
                         })),
                         contextUsage: usageRatio,
-                        reason: contextStatus.needsCompression ? 'compression' : 'threshold'
+                        reason: 'compression'
                     };
                     await this.memoryFlushManager.flush(flushContext).catch(err => {
                         logger.error('[AgentManager] Memory flush failed:', err);
                     });
                 }
-                logger.info(`[AgentManager] Auto-compressing context: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
-                // Perform auto-compression
+                logger.info(`[AgentManager] Auto-compressing context BEFORE adding user message: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
+                // Perform auto-compression on current messages
                 const compressedMessages = await this.contextGuard.autoCompress(currentMessages);
                 // Update session with compressed messages
                 session.replaceHistory(compressedMessages);
@@ -647,7 +665,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                     beforeCount: currentMessages.length,
                     afterCount: compressedMessages.length,
                 });
-                // Trigger session memory hook to save summary of compressed context
+                // Trigger session memory hook
                 try {
                     const summary = createEmptySessionSummary(sessionId, Date.now());
                     const compressedText = currentMessages
@@ -663,6 +681,17 @@ If there's nothing noteworthy, respond with an empty string.`,
                     logger.debug('[AgentManager] Session memory hook after compression failed:', err);
                 }
             }
+            // Now add user message (with multimodal content if attachments present)
+            session.addMessage({
+                role: 'user',
+                content: userContent,
+            });
+            // Log to memory system
+            this.memorySystem.appendLog(sessionId, {
+                timestamp: Date.now(),
+                role: 'user',
+                content: message,
+            }).catch(err => logger.debug('[Memory] Log append failed:', err));
             // Tool execution loop (no iteration limit - on device, almost all actions are tool calls)
             let iteration = 0;
             let finalResponse = null;
@@ -1710,7 +1739,8 @@ If there's nothing noteworthy, respond with an empty string.`,
         });
     }
     /**
-     * Build user message content, converting attachments to multimodal content blocks
+     * Build user message content, converting attachments to multimodal content blocks.
+     * For Anthropic provider, images are downloaded to base64.
      */
     async buildUserContent(message, attachments) {
         if (!attachments?.length)
@@ -1719,18 +1749,45 @@ If there's nothing noteworthy, respond with an empty string.`,
         if (message) {
             contentBlocks.push({ type: 'text', text: message });
         }
+        const isAnthropic = this.config.model.provider === 'anthropic';
         for (const att of attachments) {
             if (att.type === 'image') {
                 if (att.url) {
-                    // Remote URL — store as url source; ModelAPI converter handles format differences
-                    contentBlocks.push({
-                        type: 'image',
-                        source: {
-                            type: 'url',
-                            media_type: att.mimeType || 'image/jpeg',
-                            data: att.url,
-                        },
-                    });
+                    if (isAnthropic) {
+                        // Anthropic requires base64 — download the image
+                        try {
+                            const result = await this.modelAPI.downloadToBase64(att.url);
+                            if (result) {
+                                contentBlocks.push({
+                                    type: 'image',
+                                    source: {
+                                        type: 'base64',
+                                        media_type: result.media_type,
+                                        data: result.data,
+                                    },
+                                });
+                            }
+                            else {
+                                logger.warn(`[AgentManager] Failed to download image for Anthropic, degrading to text: ${att.url}`);
+                                contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.url} (download failed)]` });
+                            }
+                        }
+                        catch (err) {
+                            logger.warn('[AgentManager] Image download error:', err);
+                            contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.url} (error)]` });
+                        }
+                    }
+                    else {
+                        // OpenAI/Gemini support URL images directly
+                        contentBlocks.push({
+                            type: 'image',
+                            source: {
+                                type: 'url',
+                                media_type: att.mimeType || 'image/jpeg',
+                                data: att.url,
+                            },
+                        });
+                    }
                 }
                 else if (att.localPath) {
                     // Local file — read as base64

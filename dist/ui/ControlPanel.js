@@ -768,7 +768,7 @@ export class ControlPanel {
             const config = this.configManager.get();
             this.agentManager = new AgentManager(config);
             // 创建 ChatWindow
-            this.chatWindow = new ChatWindow(this.agentManager);
+            this.chatWindow = new ChatWindow(this.agentManager, config);
             // 显示聊天窗口
             const uiConfig = config.ui || {
                 floatingWindow: { x: 50, y: 100, width: 700, height: 1000 }

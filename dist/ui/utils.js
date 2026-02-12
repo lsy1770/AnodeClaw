@@ -115,7 +115,7 @@ export function createMessageBubble(message, messageId, attachments) {
     }
     return `
 <LinearLayout
-    android:id="@+id/${messageId}"
+    android:id="${messageId}"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
@@ -140,7 +140,7 @@ export function createMessageBubble(message, messageId, attachments) {
 export function createThinkingIndicator(indicatorId) {
     return `
 <LinearLayout
-    android:id="@+id/${indicatorId}"
+    android:id="${indicatorId}"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="horizontal"
@@ -166,7 +166,7 @@ export function createSessionListItem(session) {
     const preview = session.lastMessage ? escapeXml(session.lastMessage.substring(0, 50)) : '暂无消息';
     return `
 <LinearLayout
-    android:id="@+id/session_${session.sessionId}"
+    android:id="session_${session.sessionId}"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
@@ -205,7 +205,7 @@ export function createSessionListItem(session) {
         android:maxLines="2"
         android:ellipsize="end"/>
 
-    <View
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="1dp"
         android:background="#444444"

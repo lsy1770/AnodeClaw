@@ -8,7 +8,7 @@
     "anode-clawdbot": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc && xcopy assets\\prompts dist\\prompts\\ /E /I /Y && copy project.json dist\\project.json /Y",
+    "build": "tsc",
     "clean": "rm -rf dist",
     "rebuild": "npm run clean && npm run build",
     "test": "vitest",
@@ -46,13 +46,14 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.20.0",
     "@types/js-yaml": "^4.0.9",
-    "js-yaml": "^4.1.1",
+    
     "json5": "^2.2.3",
     "openai": "^4.0.0",
     "wechaty": "^1.20.2",
     "zod": "^3.22.0"
   },
   "devDependencies": {
+    "@anode177/mcp-client": "^1.0.0",
     "@types/node": "^20.0.0",
     "typescript": "^5.3.0",
     "vitest": "^1.0.0"

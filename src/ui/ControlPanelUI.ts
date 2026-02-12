@@ -11,8 +11,6 @@ import { logger } from '../utils/logger.js';
 import { ChatWindow } from './ChatWindow.js';
 import { AgentManager } from '../core/AgentManager.js';
 import { NotificationManager } from './NotificationManager.js';
-import { SessionList } from './SessionList.js';
-import { SettingsPanel } from './SettingsPanel.js';
 
 // 声明全局 ui API
 declare const ui: {
@@ -89,8 +87,6 @@ export class ControlPanel {
   private agentManager: AgentManager | null = null;
   private chatWindow: ChatWindow | null = null;
   private notificationManager: NotificationManager;
-  private sessionList: SessionList | null = null;
-  private settingsPanel: SettingsPanel | null = null;
   private isChatRunning = false;
   private currentTab: 'ai' | 'channels' | 'advanced' = 'ai';
 
@@ -143,10 +139,6 @@ export class ControlPanel {
     if (this.chatWindow) {
       this.chatWindow.close();
     }
-    this.sessionList?.close();
-    this.sessionList = null;
-    this.settingsPanel?.close();
-    this.settingsPanel = null;
     this.notificationManager.shutdown().catch(() => {});
     if (this.agentManager) {
       this.agentManager.shutdown().catch(() => {});
@@ -471,52 +463,39 @@ export class ControlPanel {
       // Save UI changes to config before starting chat
       await this.handleSaveConfig();
 
-      // Check if floating window is enabled
-      if (!this.getCheckboxState('check_enable_floating')) {
-        globalApi.toast('悬浮窗未启用，请在高级设置中勾选"启用悬浮窗"', "long");
-        return;
-      }
-
       const config = this.configManager.get();
+      const floatingEnabled = this.getCheckboxState('check_enable_floating');
+
       logger.info('[ControlPanel] Starting chat with provider:', config.model.provider);
       this.agentManager = new AgentManager(config);
-      this.chatWindow = new ChatWindow(this.agentManager);
-      await this.chatWindow.show();
       this.isChatRunning = true;
 
-      // Initialize SessionList for session management
-      this.sessionList = new SessionList(this.agentManager);
-      this.sessionList.onSessionSelect((sessionId) => {
-        logger.info(`[ControlPanel] Session selected: ${sessionId}`);
-        this.chatWindow?.switchSession(sessionId);
-      });
-      this.sessionList.onNewSession(async () => {
-        if (this.agentManager) {
-          const session = await this.agentManager.createSession({});
-          logger.info(`[ControlPanel] New session created: ${session.sessionId}`);
-          this.sessionList?.refresh();
-        }
-      });
-      this.sessionList.onDeleteSession((sessionId) => {
-        logger.info(`[ControlPanel] Session deleted: ${sessionId}`);
-      });
+      // Show floating chat window only if enabled
+      if (floatingEnabled) {
+        this.chatWindow = new ChatWindow(this.agentManager, config);
+        this.chatWindow.onConfigSave(async (updatedConfig) => {
+          try {
+            await this.configManager.save();
+            logger.info('[ControlPanel] Config saved from floating settings');
+          } catch (err) {
+            logger.error('[ControlPanel] Config save error:', err);
+          }
+        });
+        await this.chatWindow.show();
+      } else {
+        logger.info('[ControlPanel] Floating window disabled, running in headless mode');
+      }
 
-      // Initialize SettingsPanel
-      this.settingsPanel = new SettingsPanel(this.agentManager, config);
-
-      // Wire chatWindow toolbar callbacks
-      this.chatWindow.onSessionChange((_sessionId: string) => {
-        this.sessionList?.show();
-      });
-      this.chatWindow.onSettings(() => {
-        this.settingsPanel?.show();
-      });
-
-      // Show notification if enabled
+      // Show notification if enabled (works regardless of floating window)
       if (config.ui?.notifications?.enabled !== false) {
         this.notificationManager.onShowWindow(() => {
-          // Re-show chat window if hidden
-          this.chatWindow?.show();
+          if (this.chatWindow) {
+            this.chatWindow.show();
+          } else if (floatingEnabled) {
+            // Re-create chat window if it was closed
+            this.chatWindow = new ChatWindow(this.agentManager!, config);
+            this.chatWindow.show();
+          }
         });
         this.notificationManager.onQuickMessage(async (message) => {
           if (this.agentManager) {
@@ -534,12 +513,13 @@ export class ControlPanel {
         });
       }
 
-      // 切换按钮 — use cached views
+      // Toggle buttons
       this.v['btn_start_chat']?.setVisibility?.('gone');
       this.v['btn_stop_chat']?.setVisibility?.('visible');
 
-      logger.info('[ControlPanel] chat started');
-      globalApi.toast('聊天窗口已启动',"long");
+      const mode = floatingEnabled ? '悬浮窗模式' : '后台模式(通知栏交互)';
+      logger.info(`[ControlPanel] chat started (${mode})`);
+      globalApi.toast(`聊天已启动 - ${mode}`,"long");
     } catch (error) {
       logger.error('[ControlPanel] start chat failed', { error: (error as Error).message });
       globalApi.toast('启动失败: ' + (error as Error).message,"long");
@@ -552,10 +532,6 @@ export class ControlPanel {
     try {
       this.chatWindow?.close();
       this.chatWindow = null;
-      this.sessionList?.close();
-      this.sessionList = null;
-      this.settingsPanel?.close();
-      this.settingsPanel = null;
       this.notificationManager.hide().catch(() => {});
       if (this.agentManager) {
         this.agentManager.shutdown().catch(err => {

@@ -12,6 +12,53 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { logger } from '../utils/logger.js';
 /**
+ * Model-specific token limits
+ * Maps model names (or name patterns) to their actual input token limits
+ */
+export const MODEL_TOKEN_LIMITS = {
+    // Claude models
+    'claude-3-5-sonnet': 200000,
+    'claude-3-opus': 200000,
+    'claude-3-sonnet': 200000,
+    'claude-3-haiku': 200000,
+    'claude-sonnet-4': 200000,
+    'claude-opus-4': 200000,
+    // OpenAI models
+    'gpt-4': 128000,
+    'gpt-4-turbo': 128000,
+    'gpt-3.5-turbo': 16000,
+    'gpt-4o': 128000,
+    // DeepSeek models
+    'deepseek-chat': 170000,
+    'deepseek-reasoner': 170000,
+    'deepseek-v3': 170000,
+    // Gemini models
+    'gemini-1.5-pro': 2000000,
+    'gemini-1.5-flash': 1000000,
+    'gemini-pro': 32000,
+};
+/**
+ * Detect model token limit based on model name
+ * @param modelName - The model identifier
+ * @returns The estimated token limit, or default 128000 if unknown
+ */
+export function detectModelTokenLimit(modelName) {
+    const lowerModel = modelName.toLowerCase();
+    // Exact match
+    if (MODEL_TOKEN_LIMITS[lowerModel]) {
+        return MODEL_TOKEN_LIMITS[lowerModel];
+    }
+    // Pattern matching
+    for (const [pattern, limit] of Object.entries(MODEL_TOKEN_LIMITS)) {
+        if (lowerModel.includes(pattern.toLowerCase())) {
+            return limit;
+        }
+    }
+    // Default to 128k for safety
+    logger.warn(`[ModelAPI] Unknown model "${modelName}", using default token limit 128000`);
+    return 128000;
+}
+/**
  * Model API error types
  */
 export class ModelAPIError extends Error {
@@ -587,17 +634,11 @@ export class ModelAPI {
                     });
                 }
                 else if (block.source?.type === 'url') {
-                    // Anthropic requires base64; mark URL for async download
-                    // At converter time we can't do async, so embed a placeholder
-                    // The downloadToBase64 call should happen before conversion
-                    // For now, include as URL source — the native HTTP path handles it
-                    blocks.push({
-                        type: 'image',
-                        source: {
-                            type: 'url',
-                            url: block.source.data,
-                        },
-                    });
+                    // Anthropic doesn't support URL images in most cases.
+                    // Images should have been pre-downloaded to base64 in buildUserContent().
+                    // If we still get a URL here, degrade to text description.
+                    logger.warn(`[ModelAPI] Image URL passed to Anthropic converter without pre-download, degrading to text: ${block.source.data}`);
+                    blocks.push({ type: 'text', text: `[Image: ${block.source.data}]` });
                 }
             }
             else if (block.type === 'file') {

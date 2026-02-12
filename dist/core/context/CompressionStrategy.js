@@ -101,8 +101,8 @@ export class CompressionStrategyHandler {
         // Filter messages
         let toKeep = [];
         if (options.preserveImportant) {
-            // Keep important messages
-            const important = messages.filter((m) => m.metadata?.important || m.role === 'system');
+            // Keep important messages and multimodal messages
+            const important = messages.filter((m) => m.metadata?.important || m.role === 'system' || this.hasMultimodalContent(m));
             toKeep.push(...important);
         }
         // Add recent messages
@@ -152,9 +152,9 @@ export class CompressionStrategyHandler {
                 originalMessageCount: toSummarize.length,
             },
         };
-        // Prune middle messages (keep only important ones)
+        // Prune middle messages (keep only important ones and multimodal ones)
         const prunedMiddle = options.preserveImportant
-            ? toPrune.filter((m) => m.metadata?.important || m.role === 'system')
+            ? toPrune.filter((m) => m.metadata?.important || m.role === 'system' || this.hasMultimodalContent(m))
             : [];
         // Combine all parts
         const compressedMessages = [summaryMessage, ...prunedMiddle, ...toKeep];
@@ -188,6 +188,14 @@ export class CompressionStrategyHandler {
         return this.generateNaiveSummary(messages);
     }
     /**
+     * Check if a message contains multimodal content (images, files, etc.)
+     */
+    static hasMultimodalContent(message) {
+        if (!Array.isArray(message.content))
+            return false;
+        return message.content.some((b) => b.type === 'image' || b.type === 'file');
+    }
+    /**
      * Generate summary using AI model
      */
     static async generateAISummary(messages) {
@@ -195,6 +203,20 @@ export class CompressionStrategyHandler {
         const conversationText = messages
             .filter(m => m.role === 'user' || m.role === 'assistant')
             .map(m => {
+            if (this.hasMultimodalContent(m)) {
+                // For multimodal messages, describe the content without serializing binary data
+                const blocks = m.content;
+                const parts = [];
+                for (const b of blocks) {
+                    if (b.type === 'text')
+                        parts.push(b.text);
+                    else if (b.type === 'image')
+                        parts.push('[Image attached]');
+                    else if (b.type === 'file')
+                        parts.push(`[File: ${b.source?.filename || 'unknown'}]`);
+                }
+                return `${m.role}: ${parts.join(' ')}`;
+            }
             const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
             // Truncate very long messages
             const truncated = content.length > 500 ? content.slice(0, 500) + '...' : content;
@@ -242,10 +264,27 @@ export class CompressionStrategyHandler {
     static extractTopics(messages) {
         const topics = [];
         for (const message of messages) {
-            if (message.role === 'user' && typeof message.content === 'string') {
+            if (message.role === 'user') {
+                let text;
+                if (typeof message.content === 'string') {
+                    text = message.content;
+                }
+                else if (Array.isArray(message.content)) {
+                    // Extract text parts from multimodal content
+                    text = message.content
+                        .filter((b) => b.type === 'text')
+                        .map((b) => b.text)
+                        .join(' ');
+                    if (message.content.some((b) => b.type === 'image')) {
+                        text += ' [with image]';
+                    }
+                }
+                else {
+                    continue;
+                }
                 // Extract first sentence as topic
-                const firstSentence = message.content.split(/[.!?]/)[0].trim();
-                if (firstSentence.length > 10 && firstSentence.length < 100) {
+                const firstSentence = text.split(/[.!?]/)[0].trim();
+                if (firstSentence.length > 5 && firstSentence.length < 100) {
                     topics.push(firstSentence);
                 }
             }

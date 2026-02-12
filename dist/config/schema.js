@@ -27,11 +27,15 @@ export const StorageConfigSchema = z.object({
  */
 export const AgentConfigSchema = z.object({
     defaultSystemPrompt: z.string().default('You are a helpful AI assistant running on an Android device. You have access to various tools to help users automate tasks and interact with their device.'),
+    // Context window size (model's input token capacity)
+    // Claude Sonnet 4.5 = 200000, Claude Haiku = 200000
+    contextWindow: z.number().int().positive().default(200000),
     contextWindowWarning: z.number().int().positive().default(3500),
     contextWindowMax: z.number().int().positive().default(4000),
     compressionEnabled: z.boolean().default(true),
     autoSave: z.boolean().default(true),
     toolStrategy: z.enum(['always', 'auto', 'off']).default('auto'),
+    maxToolIterations: z.number().int().positive().default(20), // Maximum tool execution iterations per message
 });
 /**
  * UI configuration schema
@@ -100,6 +104,16 @@ export const ProactiveConfigSchema = z.object({
     idleSessionTimeout: z.number().int().positive().default(7200000), // 2h
 }).optional();
 /**
+ * Safety and approval configuration schema
+ */
+export const SafetyConfigSchema = z.object({
+    enabled: z.boolean().default(true),
+    trustMode: z.enum(['yolo', 'permissive', 'moderate', 'strict']).default('yolo'),
+    approvalTimeout: z.number().int().positive().default(120000), // 2 minutes
+    approvalChatId: z.string().default(''),
+    approvalPlatform: z.enum(['telegram', 'discord', 'qq', 'wechat', 'feishu', 'dingtalk']).default('telegram'),
+}).optional();
+/**
  * Memory configuration schema
  */
 export const MemoryConfigSchema = z.object({
@@ -117,4 +131,5 @@ export const ConfigSchema = z.object({
     memory: MemoryConfigSchema.optional(), // 记忆系统配置（可选）
     social: SocialPlatformConfigSchema.optional(), // 社交平台配置（可选）
     proactive: ProactiveConfigSchema, // 主动行为配置（可选）
+    safety: SafetyConfigSchema, // 安全和审批配置（可选）
 });
