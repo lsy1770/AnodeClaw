@@ -5,7 +5,12 @@
 <h1 align="center">Anode ClawdBot</h1>
 
 <p align="center">
-  <strong>Android AI Agent System , running on ACS platform with Javet Node.js engine.</strong>
+  <strong>Android AI Agent System, running on ACS platform with Anode engine.</strong>
+</p>
+
+<p align="center">
+  <a href="https://acs.yunxi668.cn">🌐 ACS Official Website</a> &middot;
+  <a href="https://doc.yunxi668.cn">📚 Documentation</a>
 </p>
 
 <p align="center">
@@ -19,6 +24,7 @@
 
 <p align="center">
   <a href="https://acs.yunxi668.cn">Website</a> &middot;
+  <a href="https://doc.yunxi668.cn">Docs</a> &middot;
   <a href="#features">Features</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#social-adapters">Social Adapters</a>
@@ -132,7 +138,7 @@ src/
 
 ## Technology Stack
 
-- **Runtime**: Javet Node.js Engine (Android)
+- **Runtime**: Anode (Android Node.js Platform)
 - **Language**: TypeScript (ES2021)
 - **AI SDK**: @anthropic-ai/sdk, openai
 - **Validation**: Zod

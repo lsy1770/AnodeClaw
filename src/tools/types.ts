@@ -81,7 +81,7 @@ export interface Tool {
   permissions?: string[];
 
   /** Tool category */
-  category?: 'file' | 'android' | 'network' | 'device' | 'ui' | 'system' | 'custom' | 'app' | 'media' | 'image' | 'storage' | 'notification' | 'ocr';
+  category?: 'file' | 'android' | 'network' | 'device' | 'ui' | 'system' | 'custom' | 'app' | 'media' | 'image' | 'storage' | 'notification' | 'ocr' | 'utility';
 
   /** Whether tool can be run in parallel */
   parallelizable?: boolean;

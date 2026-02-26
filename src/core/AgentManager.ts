@@ -18,7 +18,7 @@ import { generateSessionId } from '../utils/id.js';
 import { logger } from '../utils/logger.js';
 import { generateId } from '../utils/id.js';
 import { ToolRegistry, ToolExecutor, builtinTools, setMemorySystem, setSubAgentCoordinator } from '../tools/index.js';
-import type { ToolCall as ToolCallType } from '../tools/types.js';
+import type { ToolCall as ToolCallType, ToolResult } from '../tools/types.js';
 import { LaneManager } from './lane/LaneManager.js';
 import type { Task } from './lane/types.js';
 import { ContextWindowGuard } from './context/ContextWindowGuard.js';
@@ -1057,103 +1057,12 @@ If there's nothing noteworthy, respond with an empty string.`,
             }
           }
 
-          // Execute approved tools in parallel
-          const toolResults = await Promise.all([
-            ...approvedToolCalls.map(async (toolCall: ToolCallType) => {
-              const toolTimer = performanceMonitor.startTimer(`tool:${toolCall.name}`);
-              try {
-                // Route skill_* calls to SkillManager
-                let result;
-                if (toolCall.name.startsWith('skill_')) {
-                  const skillId = toolCall.name.replace('skill_', '');
-                  const skillResult = await this.skillManager.execute(skillId, toolCall.input);
-                  result = {
-                    success: skillResult.success,
-                    output: skillResult.output != null ? (typeof skillResult.output === 'string' ? skillResult.output : JSON.stringify(skillResult.output)) : skillResult.error || 'Skill completed',
-                    error: skillResult.error,
-                  };
-                } else {
-                  // Execute before hooks
-                  const hookCtx: ToolCallContext = {
-                    callId: toolCall.id,
-                    toolName: toolCall.name,
-                    args: toolCall.input,
-                    sessionId: session.sessionId,
-                    timestamp: Date.now(),
-                  };
-                  const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
-                  if (!beforeResult.proceed) {
-                    result = {
-                      success: beforeResult.overrideResult !== undefined,
-                      output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
-                      error: beforeResult.overrideResult === undefined ? beforeResult.blockReason : undefined,
-                    };
-                  } else {
-                    const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
-                    result = await this.toolExecutor.execute({ ...toolCall, input: effectiveInput }, {
-                      context: {
-                        sessionId: session.sessionId,
-                      },
-                    });
-                  }
-
-                  // Execute after hooks
-                  const afterCtx: AfterToolCallContext = {
-                    ...hookCtx,
-                    result: result.output,
-                    isError: !result.success,
-                    duration: Date.now() - hookCtx.timestamp,
-                  };
-                  const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
-                  if (afterResult.modifiedResult !== undefined) {
-                    result.output = afterResult.modifiedResult;
-                  }
-                }
-
-                // Emit tool:after event
-                const toolDuration = toolTimer.end();
-                this.eventBus.emit('tool:after', {
-                  toolName: toolCall.name,
-                  args: toolCall.input,
-                  result: result.output,
-                  duration: toolDuration,
-                  sessionId: session.sessionId,
-                });
-
-                // Record tool execution performance
-                performanceMonitor.recordToolExecution(toolDuration);
-
-                // Update approval record with execution result
-                this.approvalManager.updateExecutionResult(toolCall.id, {
-                  success: result.success,
-                  output: result.output,
-                  error: result.error
-                    ? typeof result.error === 'string'
-                      ? result.error
-                      : JSON.stringify(result.error)
-                    : undefined,
-                });
-
-                return result;
-              } catch (error) {
-                toolTimer.end(); // ensure timer is stopped
-                logger.error(`Tool execution failed for ${toolCall.name}:`, error);
-                return {
-                  success: false,
-                  output: null,
-                  error: error instanceof Error ? error.message : 'Unknown error',
-                };
-              }
-            }),
-            // Add denial results for denied tools
-            ...deniedToolCalls.map((toolCall: ToolCallType) => {
-              return Promise.resolve({
-                success: false,
-                output: null,
-                error: 'Tool execution denied by user or approval timeout',
-              });
-            }),
-          ]);
+          // Execute approved tools with intelligent parallelization
+          const toolResults = await this.executeToolsWithParallelization(
+            approvedToolCalls,
+            deniedToolCalls,
+            session
+          );
 
           // Add tool results to session as individual 'tool' messages
           for (let i = 0; i < toolResults.length; i++) {
@@ -1520,87 +1429,12 @@ If there's nothing noteworthy, respond with an empty string.`,
             }
           }
 
-          // Execute approved tools
-          const toolResults = await Promise.all([
-            ...approvedToolCalls.map(async (toolCall: ToolCallType) => {
-              const toolTimer = performanceMonitor.startTimer(`tool:${toolCall.name}`);
-              try {
-                let result;
-                if (toolCall.name.startsWith('skill_')) {
-                  const skillId = toolCall.name.replace('skill_', '');
-                  const skillResult = await this.skillManager.execute(skillId, toolCall.input);
-                  result = {
-                    success: skillResult.success,
-                    output: skillResult.output != null ? (typeof skillResult.output === 'string' ? skillResult.output : JSON.stringify(skillResult.output)) : skillResult.error || 'Skill completed',
-                    error: skillResult.error,
-                  };
-                } else {
-                  // Execute before hooks
-                  const hookCtx: ToolCallContext = {
-                    callId: toolCall.id,
-                    toolName: toolCall.name,
-                    args: toolCall.input,
-                    sessionId: session.sessionId,
-                    timestamp: Date.now(),
-                  };
-                  const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
-                  if (!beforeResult.proceed) {
-                    result = {
-                      success: beforeResult.overrideResult !== undefined,
-                      output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
-                      error: beforeResult.overrideResult === undefined ? beforeResult.blockReason : undefined,
-                    };
-                  } else {
-                    const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
-                    result = await this.toolExecutor.execute({ ...toolCall, input: effectiveInput }, {
-                      context: { sessionId: session.sessionId },
-                    });
-                  }
-
-                  // Execute after hooks
-                  const afterCtx: AfterToolCallContext = {
-                    ...hookCtx,
-                    result: result.output,
-                    isError: !result.success,
-                    duration: Date.now() - hookCtx.timestamp,
-                  };
-                  const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
-                  if (afterResult.modifiedResult !== undefined) {
-                    result.output = afterResult.modifiedResult;
-                  }
-                }
-
-                const toolDuration = toolTimer.end();
-                this.eventBus.emit('tool:after', {
-                  toolName: toolCall.name,
-                  args: toolCall.input,
-                  result: result.output,
-                  duration: toolDuration,
-                  sessionId: session.sessionId,
-                });
-                performanceMonitor.recordToolExecution(toolDuration);
-                this.approvalManager.updateExecutionResult(toolCall.id, {
-                  success: result.success,
-                  output: result.output,
-                  error: result.error ? JSON.stringify(result.error) : undefined,
-                });
-                return result;
-              } catch (error) {
-                toolTimer.end();
-                logger.error(`Tool execution failed for ${toolCall.name}:`, error);
-                return {
-                  success: false,
-                  output: null,
-                  error: error instanceof Error ? error.message : 'Unknown error',
-                };
-              }
-            }),
-            ...deniedToolCalls.map(() => Promise.resolve({
-              success: false,
-              output: null,
-              error: 'Tool execution denied',
-            })),
-          ]);
+          // Execute approved tools with intelligent parallelization
+          const toolResults = await this.executeToolsWithParallelization(
+            approvedToolCalls,
+            deniedToolCalls,
+            session
+          );
 
           // Add tool results
           for (let i = 0; i < toolResults.length; i++) {
@@ -2572,6 +2406,209 @@ If there's nothing noteworthy, respond with an empty string.`,
     });
 
     logger.info('[AgentManager] EventBus consumers registered');
+  }
+
+  // ===== Tool Execution with Parallelization =====
+
+  /**
+   * Execute tools with intelligent parallelization
+   * Groups tools by their parallelizable property and executes accordingly
+   *
+   * @param approvedToolCalls - Tools approved for execution
+   * @param deniedToolCalls - Tools denied by approval manager
+   * @param session - Current session
+   * @returns Array of tool results in original order
+   */
+  private async executeToolsWithParallelization(
+    approvedToolCalls: ToolCallType[],
+    deniedToolCalls: ToolCallType[],
+    session: Session
+  ): Promise<ToolResult[]> {
+    // Separate tools into parallelizable and serial
+    const parallelizable: { toolCall: ToolCallType; index: number }[] = [];
+    const serial: { toolCall: ToolCallType; index: number }[] = [];
+
+    for (let i = 0; i < approvedToolCalls.length; i++) {
+      const toolCall = approvedToolCalls[i];
+      const tool = this.toolRegistry.get(toolCall.name);
+
+      // Check if tool is parallelizable (default to true if not specified)
+      const isParallelizable = tool?.parallelizable !== false;
+
+      if (isParallelizable) {
+        parallelizable.push({ toolCall, index: i });
+      } else {
+        serial.push({ toolCall, index: i });
+      }
+    }
+
+    logger.info(
+      `[AgentManager] Tool execution plan: ${parallelizable.length} parallelizable, ${serial.length} serial (total: ${approvedToolCalls.length})`
+    );
+
+    // Create array to store results in original order
+    const results: (ToolResult | null)[] = new Array(approvedToolCalls.length + deniedToolCalls.length).fill(null);
+
+    // 1. Execute parallelizable tools in parallel
+    if (parallelizable.length > 0) {
+      logger.debug(`[AgentManager] Executing ${parallelizable.length} parallelizable tools concurrently`);
+      const parallelResults = await Promise.all(
+        parallelizable.map(({ toolCall }) => this.executeToolWithHooks(toolCall, session))
+      );
+
+      // Store results in correct positions
+      for (let i = 0; i < parallelizable.length; i++) {
+        results[parallelizable[i].index] = parallelResults[i];
+      }
+    }
+
+    // 2. Execute serial tools one by one
+    if (serial.length > 0) {
+      logger.debug(`[AgentManager] Executing ${serial.length} serial tools sequentially`);
+      for (const { toolCall, index } of serial) {
+        const result = await this.executeToolWithHooks(toolCall, session);
+        results[index] = result;
+      }
+    }
+
+    // 3. Add denied tool results at the end
+    for (let i = 0; i < deniedToolCalls.length; i++) {
+      results[approvedToolCalls.length + i] = {
+        success: false,
+        output: null,
+        error: {
+          code: 'APPROVAL_DENIED',
+          message: 'Tool execution denied by user or approval timeout',
+        },
+      };
+    }
+
+    // Filter out any null results (shouldn't happen, but for type safety)
+    return results.filter((r): r is ToolResult => r !== null);
+  }
+
+  /**
+   * Execute a single tool with hooks and event handling
+   *
+   * @param toolCall - Tool call to execute
+   * @param session - Current session
+   * @returns Tool execution result
+   */
+  private async executeToolWithHooks(
+    toolCall: ToolCallType,
+    session: Session
+  ): Promise<ToolResult> {
+    const toolTimer = performanceMonitor.startTimer(`tool:${toolCall.name}`);
+
+    try {
+      // Emit tool:before event
+      this.eventBus.emit('tool:before', {
+        toolName: toolCall.name,
+        args: toolCall.input,
+        sessionId: session.sessionId,
+      });
+
+      let result: ToolResult;
+
+      // Route skill_* calls to SkillManager
+      if (toolCall.name.startsWith('skill_')) {
+        const skillId = toolCall.name.replace('skill_', '');
+        const skillResult = await this.skillManager.execute(skillId, toolCall.input);
+        result = {
+          success: skillResult.success,
+          output: skillResult.output != null
+            ? (typeof skillResult.output === 'string' ? skillResult.output : JSON.stringify(skillResult.output))
+            : skillResult.error || 'Skill completed',
+          error: skillResult.error
+            ? {
+                code: 'SKILL_ERROR',
+                message: skillResult.error,
+              }
+            : undefined,
+        };
+      } else {
+        // Execute before hooks
+        const hookCtx: ToolCallContext = {
+          callId: toolCall.id,
+          toolName: toolCall.name,
+          args: toolCall.input,
+          sessionId: session.sessionId,
+          timestamp: Date.now(),
+        };
+
+        const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
+
+        if (!beforeResult.proceed) {
+          result = {
+            success: beforeResult.overrideResult !== undefined,
+            output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
+            error: beforeResult.overrideResult === undefined
+              ? {
+                  code: 'HOOK_BLOCKED',
+                  message: beforeResult.blockReason || 'Blocked by hook',
+                }
+              : undefined,
+          };
+        } else {
+          const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
+          result = await this.toolExecutor.execute(
+            { ...toolCall, input: effectiveInput },
+            { context: { sessionId: session.sessionId } }
+          );
+        }
+
+        // Execute after hooks
+        const afterCtx: AfterToolCallContext = {
+          ...hookCtx,
+          result: result.output,
+          isError: !result.success,
+          duration: Date.now() - hookCtx.timestamp,
+        };
+
+        const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
+        if (afterResult.modifiedResult !== undefined) {
+          result.output = afterResult.modifiedResult;
+        }
+      }
+
+      // Emit tool:after event
+      const toolDuration = toolTimer.end();
+      this.eventBus.emit('tool:after', {
+        toolName: toolCall.name,
+        args: toolCall.input,
+        result: result.output,
+        duration: toolDuration,
+        sessionId: session.sessionId,
+      });
+
+      // Record tool execution performance
+      performanceMonitor.recordToolExecution(toolDuration);
+
+      // Update approval record with execution result
+      this.approvalManager.updateExecutionResult(toolCall.id, {
+        success: result.success,
+        output: result.output,
+        error: result.error
+          ? typeof result.error === 'string'
+            ? result.error
+            : JSON.stringify(result.error)
+          : undefined,
+      });
+
+      return result;
+    } catch (error) {
+      toolTimer.end(); // ensure timer is stopped
+      logger.error(`Tool execution failed for ${toolCall.name}:`, error);
+      return {
+        success: false,
+        output: null,
+        error: {
+          code: 'EXECUTION_ERROR',
+          message: error instanceof Error ? error.message : 'Unknown error',
+          details: error,
+        },
+      };
+    }
   }
 
   // ===== Shutdown =====

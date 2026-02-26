@@ -17,6 +17,7 @@ import { notificationListenerTools } from './NotificationListenerTools.js';
 import { memoryTools, setMemorySystem } from './MemoryTools.js';
 import { subAgentTools, setSubAgentCoordinator } from './SubAgentTools.js';
 import { ocrTools } from './OcrTools.js';
+import { utilityTools } from './UtilityTools.js';
 /**
  * All built-in tools
  */
@@ -34,6 +35,7 @@ export const builtinTools = [
     ...memoryTools,
     ...subAgentTools,
     ...ocrTools,
+    ...utilityTools,
 ];
 /**
  * Get tools by category
@@ -56,4 +58,4 @@ export function getToolNames() {
 /**
  * Export individual tool collections
  */
-export { fileTools, androidTools, networkTools, deviceTools, appTools, mediaTools, imageTools, storageTools, notificationTools, notificationListenerTools, memoryTools, setMemorySystem, subAgentTools, setSubAgentCoordinator, ocrTools, };
+export { fileTools, androidTools, networkTools, deviceTools, appTools, mediaTools, imageTools, storageTools, notificationTools, notificationListenerTools, memoryTools, setMemorySystem, subAgentTools, setSubAgentCoordinator, ocrTools, utilityTools, };
