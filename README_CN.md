@@ -73,7 +73,7 @@ cd /sdcard/ACS/projects/anode-clawdbot
 ### 第五步：安装运行时依赖（设备端）
 
 ```bash
-npm install --ignore-scripts
+npm install --ignore-scripts --no-bin-links
 ```
 
 > `--ignore-scripts` 跳过 postinstall 等脚本，避免设备端缺少编译工具导致报错。

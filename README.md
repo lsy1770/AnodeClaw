@@ -80,7 +80,7 @@ cd /sdcard/ACS/projects/anode-clawdbot
 ### Step 5: Install runtime dependencies (on device)
 
 ```bash
-npm install --ignore-scripts
+npm install --ignore-scripts --no-bin-links
 ```
 
 > `--ignore-scripts` skips postinstall scripts to avoid build tool errors on the device.
