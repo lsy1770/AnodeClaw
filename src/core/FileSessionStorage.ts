@@ -60,11 +60,9 @@ export class FileSessionStorage implements SessionStorage {
       logger.debug(`Session loaded from: ${this.filePath}`);
       return data;
     } catch (error) {
-      if (error instanceof Error) {
-        logger.error(`Failed to load session: ${error.message}`);
-        throw new Error(`Session load failed: ${error.message}`);
-      }
-      throw error;
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to load session: ${msg}`);
+      throw new Error(`Session load failed: ${msg}`);
     }
   }
 
@@ -84,11 +82,9 @@ export class FileSessionStorage implements SessionStorage {
 
       logger.debug(`Session saved to: ${this.filePath}`);
     } catch (error) {
-      if (error instanceof Error) {
-        logger.error(`Failed to save session: ${error.message}`);
-        throw new Error(`Session save failed: ${error.message}`);
-      }
-      throw error;
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to save session: ${msg}`);
+      throw new Error(`Session save failed: ${msg}`);
     }
   }
 
@@ -111,11 +107,9 @@ export class FileSessionStorage implements SessionStorage {
         logger.debug(`Session file deleted: ${this.filePath}`);
       }
     } catch (error) {
-      if (error instanceof Error) {
-        logger.error(`Failed to delete session: ${error.message}`);
-        throw new Error(`Session delete failed: ${error.message}`);
-      }
-      throw error;
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to delete session: ${msg}`);
+      throw new Error(`Session delete failed: ${msg}`);
     }
   }
 

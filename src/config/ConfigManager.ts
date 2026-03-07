@@ -69,6 +69,22 @@ export class ConfigManager {
       const validated = ConfigSchema.parse(substituted);
       logger.info('Configuration validated successfully');
 
+      // Resolve relative storage paths to absolute.
+      // FileAPI uses Java's File() which resolves paths against Java's CWD (not Node.js process.cwd()).
+      // On Android, Java's CWD is typically '/' and NOT the script directory, so relative paths
+      // like './data/sessions' would resolve to '/data/sessions' (system-protected, unwritable).
+      // We must convert to absolute using process.cwd() (= Node.js working dir = project directory).
+      const toAbsPath = (p: string): string => {
+        if (!p || p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) return p;
+        const cwd = (typeof process !== 'undefined' && process.cwd) ? process.cwd() : '';
+        if (!cwd) return p;
+        const rel = p.startsWith('./') ? p.slice(2) : p;
+        return `${cwd}/${rel}`;
+      };
+      validated.storage.sessionDir = toAbsPath(validated.storage.sessionDir);
+      validated.storage.memoryDir  = toAbsPath(validated.storage.memoryDir);
+      logger.debug(`[ConfigManager] Storage paths resolved: sessions=${validated.storage.sessionDir}, memory=${validated.storage.memoryDir}`);
+
       // Store configuration and snapshot for hot reload
       this.config = validated;
       this.configPath = path;

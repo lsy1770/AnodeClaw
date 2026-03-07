@@ -266,6 +266,38 @@ export class ModelAPI {
         }
     }
     /**
+     * Trim converted Anthropic messages so the full request body stays below maxBytes.
+     * Removes oldest messages first (index 0+), always keeping at least 2 messages.
+     * Also drops base64 image data from stripped messages to save more space.
+     */
+    trimMessagesToBodyLimit(messages, systemPrompt, tools, maxBytes = 5 * 1024 * 1024 // 5 MB — well under the 6 MB hard limit
+    ) {
+        const estimate = () => JSON.stringify({ system: systemPrompt, messages, tools }).length;
+        if (estimate() <= maxBytes)
+            return messages;
+        logger.warn(`[ModelAPI] Request body too large (${estimate()} bytes), trimming old messages…`);
+        // Strip base64 payloads from content blocks first (images in old messages are the usual culprit)
+        let trimmed = messages.map(msg => {
+            if (!Array.isArray(msg.content))
+                return msg;
+            const stripped = msg.content.map((block) => {
+                if (block?.type === 'image' && block?.source?.type === 'base64') {
+                    return { type: 'text', text: '[image removed to fit context]' };
+                }
+                return block;
+            });
+            return { ...msg, content: stripped };
+        });
+        // Then drop oldest messages until we fit
+        while (trimmed.length > 2) {
+            trimmed = trimmed.slice(1);
+            if (estimate() <= maxBytes)
+                break;
+        }
+        logger.warn(`[ModelAPI] Trimmed to ${trimmed.length} messages (${estimate()} bytes)`);
+        return trimmed;
+    }
+    /**
      * Convert internal message format to Anthropic format
      */
     convertMessagesToAnthropicFormat(messages) {
@@ -1066,7 +1098,7 @@ export class ModelAPI {
         if (!url.endsWith('/v1/messages')) {
             url = url.replace(/\/$/, '') + '/v1/messages';
         }
-        const messages = this.convertMessagesToAnthropicFormat(params.messages);
+        const messages = this.trimMessagesToBodyLimit(this.convertMessagesToAnthropicFormat(params.messages), params.systemPrompt, params.tools);
         const requestBody = {
             model: params.model,
             max_tokens: params.maxTokens,
@@ -1075,8 +1107,7 @@ export class ModelAPI {
             messages,
             tools: params.tools,
         };
-        logger.info('[ModelAPI] Native HTTP request to:', url);
-        logger.debug('[ModelAPI] Request body:', JSON.stringify(requestBody, null, 2));
+        logger.info('[ModelAPI] Native HTTP request to:', url, `(body ~${JSON.stringify(requestBody).length} bytes)`);
         try {
             const response = await fetch(url, {
                 method: 'POST',
@@ -1102,8 +1133,9 @@ export class ModelAPI {
         catch (error) {
             if (error instanceof ModelAPIError)
                 throw error;
-            logger.error('[ModelAPI] Native HTTP error:', error);
-            throw new ModelAPIError(error.message || 'Network error', 'NETWORK_ERROR');
+            const msg = error instanceof Error ? error.message : String(error);
+            logger.error('[ModelAPI] Native HTTP error:', msg);
+            throw new ModelAPIError(msg || 'Network error', 'NETWORK_ERROR');
         }
     }
     /**
@@ -1117,7 +1149,7 @@ export class ModelAPI {
         if (!url.endsWith('/v1/messages')) {
             url = url.replace(/\/$/, '') + '/v1/messages';
         }
-        const messages = this.convertMessagesToAnthropicFormat(params.messages);
+        const messages = this.trimMessagesToBodyLimit(this.convertMessagesToAnthropicFormat(params.messages), params.systemPrompt, params.tools);
         const requestBody = {
             model: params.model,
             max_tokens: params.maxTokens,
@@ -1127,7 +1159,7 @@ export class ModelAPI {
             tools: params.tools,
             stream: true,
         };
-        logger.info('[ModelAPI] Native HTTP streaming request to:', url);
+        logger.info('[ModelAPI] Native HTTP streaming request to:', url, `(body ~${JSON.stringify(requestBody).length} bytes)`);
         try {
             const response = await fetch(url, {
                 method: 'POST',

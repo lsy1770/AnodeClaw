@@ -18,6 +18,8 @@ import { memoryTools, setMemorySystem } from './MemoryTools.js';
 import { subAgentTools, setSubAgentCoordinator } from './SubAgentTools.js';
 import { ocrTools } from './OcrTools.js';
 import { utilityTools } from './UtilityTools.js';
+import { cronTools } from './CronTool.js';
+import { codeExecutionTools } from './CodeExecutionTools.js';
 /**
  * All built-in tools
  */
@@ -36,6 +38,8 @@ export const builtinTools = [
     ...subAgentTools,
     ...ocrTools,
     ...utilityTools,
+    ...cronTools,
+    ...codeExecutionTools,
 ];
 /**
  * Get tools by category
@@ -58,4 +62,4 @@ export function getToolNames() {
 /**
  * Export individual tool collections
  */
-export { fileTools, androidTools, networkTools, deviceTools, appTools, mediaTools, imageTools, storageTools, notificationTools, notificationListenerTools, memoryTools, setMemorySystem, subAgentTools, setSubAgentCoordinator, ocrTools, utilityTools, };
+export { fileTools, androidTools, networkTools, deviceTools, appTools, mediaTools, imageTools, storageTools, notificationTools, notificationListenerTools, memoryTools, setMemorySystem, subAgentTools, setSubAgentCoordinator, ocrTools, utilityTools, cronTools, codeExecutionTools, };

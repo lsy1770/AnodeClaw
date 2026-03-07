@@ -6,8 +6,6 @@
 
 import { logger } from '../../utils/logger.js';
 import type { HeartbeatTaskConfig } from './types.js';
-import type { DailyLogManager } from '../memory/DailyLogManager.js';
-import type { MemorySystem } from '../memory/MemorySystem.js';
 
 // 声明 Anode 全局 API
 declare const device: {
@@ -165,85 +163,4 @@ export function createCleanupTask(options: {
   };
 }
 
-/**
- * Create a daily log archival task (runs at midnight)
- *
- * Archives yesterday's daily log as a MemoryEntry via memorySystem.createMemory()
- * and carries forward pending tasks to today's log.
- */
-export function createDailyLogArchivalTask(options: {
-  dailyLogManager: DailyLogManager;
-  memorySystem: MemorySystem;
-  /** Cron schedule (default: midnight "0 0 * * *") */
-  cron?: string;
-}): HeartbeatTaskConfig {
-  const {
-    dailyLogManager,
-    memorySystem,
-    cron = '0 0 * * *',
-  } = options;
-
-  return {
-    id: 'builtin:daily-log-archival',
-    name: 'Daily Log Archival',
-    description: 'Archives yesterday\'s daily log and carries forward pending tasks',
-    schedule: { type: 'cron', cron },
-    enabled: true,
-    handler: async () => {
-      logger.info('[DailyLogArchival] Starting daily log archival...');
-
-      try {
-        // Get yesterday's date
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yDate = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
-
-        const yLog = await dailyLogManager.getLogByDate(yDate);
-
-        // Only archive if there's meaningful content
-        const hasContent = yLog.sessions.length > 0
-          || yLog.tasksCompleted.length > 0
-          || yLog.insights.length > 0
-          || yLog.errors.length > 0;
-
-        if (hasContent) {
-          // Build a summary for the memory entry
-          const parts: string[] = [`Daily summary for ${yDate}:`];
-          if (yLog.sessions.length > 0) {
-            parts.push(`Sessions: ${yLog.sessions.length}`);
-          }
-          if (yLog.tasksCompleted.length > 0) {
-            parts.push(`Completed: ${yLog.tasksCompleted.join(', ')}`);
-          }
-          if (yLog.insights.length > 0) {
-            parts.push(`Insights: ${yLog.insights.join('; ')}`);
-          }
-          if (yLog.errors.length > 0) {
-            parts.push(`Errors: ${yLog.errors.length}`);
-          }
-
-          await memorySystem.createMemory(
-            `Daily Log - ${yDate}`,
-            parts.join('\n'),
-            { tags: ['daily-log', 'archive'], importance: 'low' }
-          );
-
-          logger.info(`[DailyLogArchival] Archived daily log for ${yDate}`);
-        }
-
-        // Carry forward pending tasks to today
-        if (yLog.tasksPending.length > 0) {
-          for (const task of yLog.tasksPending) {
-            await dailyLogManager.logTaskPending(task);
-          }
-          logger.info(`[DailyLogArchival] Carried forward ${yLog.tasksPending.length} pending task(s)`);
-        }
-      } catch (error) {
-        logger.error('[DailyLogArchival] Archival failed:', error);
-      }
-    },
-    onError: (error) => {
-      logger.error('[DailyLogArchival] Task error:', error.message);
-    },
-  };
-}
+// createDailyLogArchivalTask removed — daily log replaced by ActivityLog + context_checkpoint

@@ -26,6 +26,7 @@ export interface EventMap {
   'message:assistant': { sessionId: string; content: string };
   'memory:saved': { title: string; tags: string[] };
   'agent:idle': { sessionId: string; idleDuration: number };
+  'proactiveMessage': { sessionId: string; content: string };
 }
 
 /**

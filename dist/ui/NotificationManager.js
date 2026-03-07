@@ -14,7 +14,6 @@ import { logger } from '../utils/logger.js';
  */
 export class NotificationManager {
     constructor() {
-        this.notificationId = null;
         this.isActive = false;
         this.quickMsgWindowCreated = false;
     }
@@ -31,7 +30,7 @@ export class NotificationManager {
             logger.warn('[NotificationManager] Notification permission not granted');
         }
         try {
-            this.notificationId = await notification.show('Anode ClawdBot', '点击打开 AI 助手', {
+            await notification.show('Anode ClawdBot', '点击打开 AI 助手', {
                 autoCancel: false,
                 actions: [
                     { title: '打开' },
@@ -39,7 +38,7 @@ export class NotificationManager {
                 ],
             });
             this.isActive = true;
-            logger.info(`[NotificationManager] Notification shown (id: ${this.notificationId})`);
+            logger.info(`[NotificationManager] Notification shown`);
         }
         catch (error) {
             logger.error('[NotificationManager] Failed to show notification:', error);
@@ -50,12 +49,13 @@ export class NotificationManager {
      * Hide notification
      */
     async hide() {
-        if (this.notificationId === null || !this.isActive) {
+        if (!this.isActive) {
             return;
         }
         try {
-            await notification.cancel(this.notificationId);
-            this.notificationId = null;
+            // Kotlin NotificationAPI doesn't expose notification IDs to JS,
+            // so we use cancelAll() to dismiss our persistent notification.
+            await notification.cancelAll();
             this.isActive = false;
             logger.info('[NotificationManager] Notification hidden');
         }
@@ -67,12 +67,12 @@ export class NotificationManager {
      * Update notification message text
      */
     async update(message) {
-        if (this.notificationId === null || !this.isActive) {
+        if (!this.isActive) {
             return;
         }
         try {
-            // Re-show with updated content (Anode notification API updates via re-show)
-            this.notificationId = await notification.show('Anode ClawdBot', message, {
+            // Re-show with updated content (creates a new notification; Kotlin manages IDs internally)
+            await notification.show('Anode ClawdBot', message, {
                 autoCancel: false,
                 actions: [
                     { title: '打开' },
@@ -90,15 +90,10 @@ export class NotificationManager {
      */
     async showProgress(title, progress, max = 100) {
         try {
-            if (this.notificationId !== null) {
-                await notification.updateProgress(this.notificationId, progress, max);
-            }
-            else {
-                this.notificationId = await notification.show(title, `${progress}/${max}`, {
-                    progress,
-                    autoCancel: false,
-                });
-            }
+            await notification.show(title, `${progress}/${max}`, {
+                progress,
+                autoCancel: false,
+            });
         }
         catch (error) {
             logger.error('[NotificationManager] Failed to show progress:', error);
@@ -109,18 +104,18 @@ export class NotificationManager {
      */
     async showMessage(title, message, duration = 3000) {
         try {
-            const msgId = await notification.show(title, message, {
+            await notification.show(title, message, {
                 autoCancel: true,
                 bigText: message,
             });
-            // Auto-cancel after duration
+            // Auto-cancel after duration (cancelAll is the only option since Kotlin doesn't expose IDs)
             if (duration > 0) {
                 setTimeout(async () => {
                     try {
-                        await notification.cancel(msgId);
+                        await notification.cancelAll();
                     }
                     catch {
-                        // Ignore cancel errors (may already be dismissed)
+                        // Ignore cancel errors
                     }
                 }, duration);
             }

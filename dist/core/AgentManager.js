@@ -19,16 +19,13 @@ import { LaneManager } from './lane/LaneManager.js';
 import { ContextWindowGuard } from './context/ContextWindowGuard.js';
 import { setCompressionModelAPI } from './context/CompressionStrategy.js';
 import { ApprovalManager } from './safety/ApprovalManager.js';
-import { HeartbeatManager, createStatusCheckTask, createCleanupTask, createDailyLogArchivalTask } from './heartbeat/index.js';
+import { HeartbeatManager, createStatusCheckTask, createCleanupTask } from './heartbeat/index.js';
 import { SkillManager, builtinSkills } from '../skills/index.js';
 import { SkillRetrieval } from '../skills/retrieval/SkillRetrieval.js';
 import { PromptBuilder } from './prompts/PromptBuilder.js';
 import { SystemPromptBuilder } from './prompts/SystemPromptBuilder.js';
-import { MemorySystem } from './memory/MemorySystem.js';
-import { DailyLogManager } from './memory/DailyLogManager.js';
-import { SemanticMemory } from './memory/SemanticMemory.js';
-import { SessionMemoryHook, createEmptySessionSummary } from './memory/SessionMemoryHook.js';
-import { MemoryFlushManager } from './memory/MemoryFlush.js';
+import { MemoryStore } from './memory/MemoryStore.js';
+import { ActivityLog } from './memory/ActivityLog.js';
 import { ProactiveBehavior } from './proactive/ProactiveBehavior.js';
 import { SocialAdapterManager, TelegramAdapter, QQAdapter, QQGuildAdapter, WeChatAdapter, DiscordAdapter, FeishuAdapter, DingTalkAdapter, } from '../social/index.js';
 import { ToolUsageStrategy } from '../tools/ToolUsageStrategy.js';
@@ -41,6 +38,87 @@ import { performanceMonitor } from '../utils/performance.js';
 import { StreamingHandler } from './streaming/StreamingHandler.js';
 import { getToolHooksManager } from './tools/ToolHooks.js';
 import { EventBus } from './EventBus.js';
+/**
+ * Repair orphaned tool_use blocks in message history.
+ *
+ * When a streaming response is interrupted after tool_use blocks are emitted
+ * but before tool_results are saved, the conversation history becomes corrupt
+ * and every subsequent API call fails with:
+ *   "An assistant message with tool_calls must be followed by tool messages"
+ *
+ * This function finds such orphaned blocks and inserts synthetic error
+ * tool_result messages so the history remains valid.
+ */
+function sanitizeMessages(messages) {
+    const result = [];
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        result.push(msg);
+        if (msg.role !== 'assistant')
+            continue;
+        // Collect tool call ids from this assistant message.
+        // Two storage formats exist:
+        //   1. Anthropic format  — content blocks with { type: 'tool_use', id }
+        //   2. OpenAI/streaming  — metadata.toolCalls array with { id }
+        const toolUseIds = [];
+        if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (block.type === 'tool_use' && block.id) {
+                    toolUseIds.push(block.id);
+                }
+            }
+        }
+        const metaToolCalls = msg.metadata?.toolCalls;
+        if (Array.isArray(metaToolCalls)) {
+            for (const tc of metaToolCalls) {
+                if (tc.id && !toolUseIds.includes(tc.id)) {
+                    toolUseIds.push(tc.id);
+                }
+            }
+        }
+        if (toolUseIds.length === 0)
+            continue;
+        // Check what tool ids are covered by subsequent messages.
+        const coveredIds = new Set();
+        // Anthropic format: next user message with tool_result content blocks
+        const next = messages[i + 1];
+        if (next && next.role === 'user' && Array.isArray(next.content)) {
+            for (const block of next.content) {
+                if (block.type === 'tool_result' && block.tool_use_id) {
+                    coveredIds.add(block.tool_use_id);
+                }
+            }
+        }
+        // OpenAI/streaming format: consecutive role:'tool' messages with metadata.tool_call_id
+        let j = i + 1;
+        while (j < messages.length && messages[j].role === 'tool') {
+            const toolCallId = messages[j].metadata?.tool_call_id;
+            if (toolCallId)
+                coveredIds.add(toolCallId);
+            j++;
+        }
+        // Insert synthetic role:'tool' messages for uncovered ids.
+        // Using role:'tool' works for both converters:
+        //   - convertMessagesToAnthropicFormat → wraps in user message with tool_result block
+        //   - convertMessagesToOpenAIFormat    → keeps as { role:'tool', tool_call_id }
+        const missing = toolUseIds.filter((id) => !coveredIds.has(id));
+        if (missing.length > 0) {
+            logger.warn(`[sanitizeMessages] Inserting ${missing.length} synthetic tool_result(s) for orphaned tool_use blocks`);
+            for (const id of missing) {
+                result.push({
+                    role: 'tool',
+                    content: 'Tool execution was interrupted.',
+                    metadata: {
+                        tool_call_id: id,
+                        tool_name: 'unknown',
+                        is_error: true,
+                    },
+                });
+            }
+        }
+    }
+    return result;
+}
 /**
  * Agent Manager Class
  *
@@ -135,65 +213,18 @@ export class AgentManager {
         this.promptBuilder.initialize().catch(err => {
             logger.warn('[AgentManager] PromptBuilder initialization failed (identity files may not exist yet):', err);
         });
-        // Initialize Memory System
-        this.memorySystem = new MemorySystem({
-            sessionLogsDir: `${config.storage.sessionDir}/logs`,
-            memoryFilesDir: config.storage.memoryDir || `${config.storage.sessionDir}/memories`,
+        // Initialize Memory Store (3-layer memory system)
+        const memoryDir = config.storage.memoryDir || `${config.storage.sessionDir}/memories`;
+        this.memoryStore = new MemoryStore({ memoryDir });
+        this.memoryStore.initialize().catch(err => {
+            logger.error('[AgentManager] MemoryStore initialization failed:', err);
         });
-        // Initialize memory system directories
-        this.memorySystem.initialize().catch(err => {
-            logger.error('[AgentManager] MemorySystem initialization failed:', err);
-        });
-        // Inject memory system instance into MemoryTools
-        setMemorySystem(this.memorySystem);
-        // Initialize Daily Log Manager
-        this.dailyLogManager = new DailyLogManager(config.storage.memoryDir || `${config.storage.sessionDir}/memories`);
-        this.dailyLogManager.initialize().catch(err => {
-            logger.warn('[AgentManager] DailyLogManager initialization failed:', err);
-        });
-        // Initialize Semantic Memory
-        this.semanticMemory = new SemanticMemory(this.memorySystem, this.dailyLogManager);
-        this.semanticMemory.initialize().catch(err => {
-            logger.warn('[AgentManager] SemanticMemory initialization failed:', err);
-        });
-        // Initialize Session Memory Hook (Automatic Session Summary)
-        this.sessionMemoryHook = new SessionMemoryHook({
-            enabled: config.memory?.enabled ?? true,
-            onMemorySave: async (entry) => {
-                try {
-                    // Save to persistent memory
-                    await this.memorySystem.saveMemory(entry);
-                    // Also append to MEMORY.md for medium/high importance
-                    if (entry.importance === 'high' || entry.importance === 'medium') {
-                        await this.memorySystem.appendToMainMemory(entry.title, entry.content);
-                    }
-                    // Log to daily log as an insight
-                    await this.dailyLogManager.logInsight(`Session summary saved: "${entry.title}"`);
-                }
-                catch (error) {
-                    logger.error('[AgentManager] Failed to save session memory:', error);
-                }
-            }
-        });
-        // Initialize Memory Flush Manager (Context Compaction Persistence)
-        this.memoryFlushManager = new MemoryFlushManager({
-            enabled: config.memory?.enabled ?? true,
-            saveMemory: async (entry) => {
-                try {
-                    await this.memorySystem.saveMemory(entry);
-                    // Also append to MEMORY.md for medium/high importance
-                    if (entry.importance === 'high' || entry.importance === 'medium') {
-                        await this.memorySystem.appendToMainMemory(entry.title, entry.content);
-                    }
-                    await this.dailyLogManager.logInsight(`Context flushed to memory: "${entry.title}"`);
-                }
-                catch (error) {
-                    logger.error('[AgentManager] Failed to save flush memory:', error);
-                }
-            }
-        });
+        this.activityLog = new ActivityLog(memoryDir);
+        this.activityLog.initialize().catch(() => { });
+        // Inject into MemoryTools
+        setMemorySystem(this.memoryStore);
         // Initialize Proactive Behavior
-        this.proactiveBehavior = new ProactiveBehavior(this.config.proactive ?? undefined, this.memorySystem, this.dailyLogManager, () => this.getActiveSessions());
+        this.proactiveBehavior = new ProactiveBehavior(this.config.proactive ?? undefined, this.memoryStore, () => this.getActiveSessions());
         // Register AI insight generator for proactive behavior
         this.proactiveBehavior.setAIInsightGenerator(async (context) => {
             try {
@@ -229,24 +260,24 @@ If there's nothing noteworthy, respond with an empty string.`,
         this.registerSocialAdapters();
         this.proactiveBehavior.on('suggestions', async (suggestions) => {
             for (const s of suggestions) {
-                logger.info(`[Proactive] [${s.priority}] ${s.title}: ${s.description}`);
-                // Send push notification for medium/high priority suggestions
-                if ((s.priority === 'high' || s.priority === 'medium') && typeof notification !== 'undefined') {
-                    try {
-                        await notification.show(`🤖 ${s.title}`, s.description);
-                        logger.info(`[Proactive] Notification sent: ${s.title}`);
-                    }
-                    catch (e) {
-                        logger.error('[Proactive] Notification failed', e);
-                    }
+                logger.info(`[Proactive] [${s.priority}] ${s.title}: ${s.description.slice(0, 80)}`);
+            }
+            // System notification for high-priority items only (batch into one)
+            const urgent = suggestions.filter(s => s.priority === 'high');
+            if (urgent.length > 0 && typeof notification !== 'undefined') {
+                try {
+                    const title = urgent.length === 1 ? `🤖 ${urgent[0].title}` : `🤖 ${urgent.length} 条重要提醒`;
+                    const body = urgent.map(s => s.description).join('\n').slice(0, 200);
+                    await notification.show(title, body);
                 }
-                // Broadcast to social channels
-                if (this.socialManager && (s.priority === 'high' || s.priority === 'medium')) {
-                    this.socialManager.broadcast(`🤖 [${s.title}]\n${s.description}`).catch(err => {
-                        logger.error('[Proactive] Social broadcast failed', err);
-                    });
+                catch (e) {
+                    logger.debug('[Proactive] System notification failed:', e);
                 }
             }
+        });
+        // AI-synthesized proactive message → inject directly into active chat session
+        this.proactiveBehavior.on('proactiveMessage', async (msg) => {
+            await this.injectProactiveMessage(msg);
         });
         // Register default heartbeat tasks (now includes archival + proactive)
         this.registerDefaultHeartbeatTasks();
@@ -335,13 +366,10 @@ If there's nothing noteworthy, respond with an empty string.`,
             this.heartbeatManager.register(createCleanupTask({
                 sessionsDir: this.config.storage.sessionDir,
             }));
-            // Daily log archival at midnight
-            this.heartbeatManager.register(createDailyLogArchivalTask({
-                dailyLogManager: this.dailyLogManager,
-                memorySystem: this.memorySystem,
-            }));
-            // Proactive behavior periodic check
+            // Daily log archival removed — replaced by context_checkpoint tool
+            // Proactive behavior: full 15-min check + fast 2-min sensor check
             this.heartbeatManager.register(this.proactiveBehavior.createHeartbeatTask());
+            this.heartbeatManager.register(this.proactiveBehavior.createFastHeartbeatTask());
             logger.info('Registered default heartbeat tasks');
         }
         catch (error) {
@@ -552,17 +580,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                 const history = session.buildContext();
                 // Filter out system prompt for summary
                 const conversation = history.filter(m => m.role !== 'system');
-                const startTime = session.createdAt || Date.now();
-                const summary = createEmptySessionSummary(sessionId, startTime);
-                // Populate summary with conversation text
-                const messages = conversation.map(msg => `${msg.role}: ${typeof msg.content === 'string' ? msg.content : '[Complex Content]'}`).join('\n\n');
-                summary.summaryText = messages.slice(0, 5000); // Limit size
-                summary.topics = ['Session Archive']; // Basic topic
-                // Use hook to process and save
-                await this.sessionMemoryHook.onSessionEnd(summary, conversation.length);
+                // Log session end to activity log
+                await this.activityLog.logSession(sessionId, 'end', `${conversation.length} messages`);
             }
             catch (error) {
-                logger.error(`[AgentManager] Failed to run memory hook for session ${sessionId}`, error);
+                logger.error(`[AgentManager] Failed to log session end for ${sessionId}`, error);
             }
             await session.delete();
             this.sessions.delete(sessionId);
@@ -582,6 +604,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             id: `msg-${Date.now()}`,
             name: `sendMessage:${sessionId}`,
             priority: 'normal',
+            timeout: 0, // No lane-level timeout for agent tasks (agents may run many tool iterations)
             execute: async () => {
                 return this.processSendMessage(sessionId, message, attachments);
             },
@@ -601,6 +624,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             id: `msg-${Date.now()}`,
             name: `sendMessage:${sessionId}`,
             priority: 'normal',
+            timeout: 0, // No lane-level timeout for agent tasks
             execute: async () => {
                 return this.processSendMessageWithStreaming(sessionId, message, onStream, attachments);
             },
@@ -634,25 +658,6 @@ If there's nothing noteworthy, respond with an empty string.`,
             const contextStatus = this.contextGuard.checkStatus(messagesWithUser);
             // 如果添加用户消息后会触发压缩，先压缩再添加
             if (contextStatus.needsCompression) {
-                // Pre-compression memory flush
-                const usageRatio = contextStatus.currentTokens / contextStatus.maxTokens;
-                if (this.memoryFlushManager.shouldFlush(usageRatio)) {
-                    logger.info(`[AgentManager] Triggering memory flush (usage: ${(usageRatio * 100).toFixed(1)}%)`);
-                    const flushContext = {
-                        sessionId: sessionId,
-                        messages: currentMessages.map(m => ({
-                            role: m.role,
-                            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-                            timestamp: m.timestamp,
-                            metadata: m.metadata
-                        })),
-                        contextUsage: usageRatio,
-                        reason: 'compression'
-                    };
-                    await this.memoryFlushManager.flush(flushContext).catch(err => {
-                        logger.error('[AgentManager] Memory flush failed:', err);
-                    });
-                }
                 logger.info(`[AgentManager] Auto-compressing context BEFORE adding user message: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
                 // Perform auto-compression on current messages
                 const compressedMessages = await this.contextGuard.autoCompress(currentMessages);
@@ -665,33 +670,15 @@ If there's nothing noteworthy, respond with an empty string.`,
                     beforeCount: currentMessages.length,
                     afterCount: compressedMessages.length,
                 });
-                // Trigger session memory hook
-                try {
-                    const summary = createEmptySessionSummary(sessionId, Date.now());
-                    const compressedText = currentMessages
-                        .filter(m => m.role !== 'system')
-                        .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content.slice(0, 200) : '[Complex]'}`)
-                        .join('\n');
-                    summary.summaryText = compressedText.slice(0, 3000);
-                    summary.topics = ['Context Compression'];
-                    await this.sessionMemoryHook.onSessionEnd(summary, currentMessages.length);
-                    logger.debug('[AgentManager] Session memory saved after context compression');
-                }
-                catch (err) {
-                    logger.debug('[AgentManager] Session memory hook after compression failed:', err);
-                }
+                this.activityLog.logInfo(`Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`).catch(() => { });
             }
             // Now add user message (with multimodal content if attachments present)
             session.addMessage({
                 role: 'user',
                 content: userContent,
             });
-            // Log to memory system
-            this.memorySystem.appendLog(sessionId, {
-                timestamp: Date.now(),
-                role: 'user',
-                content: message,
-            }).catch(err => logger.debug('[Memory] Log append failed:', err));
+            // Log user message
+            this.activityLog.logSession(sessionId, 'start', message.slice(0, 80)).catch(() => { });
             // Tool execution loop (no iteration limit - on device, almost all actions are tool calls)
             let iteration = 0;
             let finalResponse = null;
@@ -713,33 +700,26 @@ If there's nothing noteworthy, respond with an empty string.`,
                         ? systemMessage.content
                         : ''
                     : '';
-                // Enrich system prompt with semantic memory context (first iteration only)
+                // Enrich system prompt with memory context (first iteration only)
                 if (iteration === 1) {
                     try {
-                        const relevantCtx = await this.semanticMemory.getRelevantContext(message);
-                        if (relevantCtx.content) {
-                            systemPrompt = systemPrompt + '\n\n' + relevantCtx.content;
-                            logger.debug(`[SemanticMemory] Injected ${relevantCtx.sources.length} relevant context(s) into prompt`);
+                        const memCtx = await this.memoryStore.getRelevantContext(message);
+                        if (memCtx) {
+                            systemPrompt = systemPrompt + '\n\n' + memCtx;
+                            logger.debug('[MemoryStore] Injected relevant context into prompt');
                         }
                     }
                     catch (err) {
-                        logger.debug('[SemanticMemory] Context enrichment failed:', err);
-                    }
-                    // Inject persistent memories from MemorySystem
-                    try {
-                        const memories = await this.memorySystem.semanticSearch(message, 5);
-                        if (memories.length > 0) {
-                            const memoryContext = memories.map(m => `- **${m.entry.title}**: ${m.entry.content.slice(0, 300)}`).join('\n');
-                            systemPrompt += '\n\n## Relevant Memories\n' + memoryContext;
-                            logger.debug(`[MemorySystem] Injected ${memories.length} persistent memory(s) into prompt`);
-                        }
-                    }
-                    catch (err) {
-                        logger.debug('[MemorySystem] Memory search failed:', err);
+                        logger.debug('[MemoryStore] Context enrichment failed:', err);
                     }
                 }
-                // Filter out system message from messages
-                const messages = context.filter((m) => m.role !== 'system');
+                // Filter out system message from messages, then repair any orphaned tool_use blocks
+                let messages = sanitizeMessages(context.filter((m) => m.role !== 'system'));
+                // Byte-size pre-check: base64 images have an extreme bytes/token ratio
+                // (each ~500KB–2MB) while token-based compression triggers at 170k tokens.
+                // 3–4 screenshots can exceed 6MB bytes with only ~15k tokens — well below
+                // the compression threshold. Strip images proactively before the API call.
+                messages = this.stripBase64ImagesIfNeeded(messages);
                 // Decide whether to include tools (ToolUsageStrategy)
                 const toolMode = this.config.agent.toolStrategy || 'auto';
                 const toolDecision = ToolUsageStrategy.analyzeMessage(message, toolMode);
@@ -847,24 +827,10 @@ If there's nothing noteworthy, respond with an empty string.`,
             // Record performance metrics
             const requestDuration = requestTimer.end();
             performanceMonitor.recordRequest(requestDuration);
-            // Log assistant response to memory
+            // Log response to activity log
             if (finalResponse && finalResponse.type === 'text') {
-                this.memorySystem.appendLog(sessionId, {
-                    timestamp: Date.now(),
-                    role: 'assistant',
-                    content: finalResponse.content,
-                    metadata: { tokens: finalResponse.usage?.inputTokens, executionTime: requestDuration },
-                }).catch(err => logger.debug('[Memory] Log append failed:', err));
-                // Log session to daily log
                 const sessionSummary = message.slice(0, 100);
-                this.dailyLogManager.logSession({
-                    id: sessionId.slice(0, 8),
-                    timeRange: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-                    summary: sessionSummary,
-                    result: 'success',
-                }).catch(err => logger.debug('[DailyLog] Session log failed:', err));
-                // Incrementally index new user message for semantic search
-                this.semanticMemory.addToIndex(`msg:${sessionId}:${Date.now()}`, message, 'session-summary', `User message in ${sessionId.slice(0, 8)}`).catch(err => logger.debug('[SemanticMemory] Indexing failed:', err));
+                this.activityLog.logSession(sessionId, 'end', sessionSummary).catch(() => { });
                 // Proactive analysis after task completion
                 this.proactiveBehavior.analyzeTaskCompletion(sessionSummary, 'success')
                     .catch(err => logger.debug('[Proactive] Post-task analysis failed:', err));
@@ -876,8 +842,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             return finalResponse;
         }
         catch (error) {
-            // Log error to daily log
-            this.dailyLogManager.logError(error instanceof Error ? error.message : 'Unknown error in processSendMessage').catch(() => { });
+            this.activityLog.logError(error instanceof Error ? error.message : 'Unknown error in processSendMessage').catch(() => { });
             return this.handleError(error);
         }
     }
@@ -899,35 +864,12 @@ If there's nothing noteworthy, respond with an empty string.`,
                 role: 'user',
                 content: userContent,
             });
-            // Log to memory system
-            this.memorySystem.appendLog(sessionId, {
-                timestamp: Date.now(),
-                role: 'user',
-                content: message,
-            }).catch(err => logger.debug('[Memory] Log append failed:', err));
+            // Log user message
+            this.activityLog.logSession(sessionId, 'start', message.slice(0, 80)).catch(() => { });
             // Check context window and auto-compress if needed
             const currentMessages = session.buildContext();
             const contextStatus = this.contextGuard.checkStatus(currentMessages);
             if (contextStatus.needsCompression) {
-                // Pre-compression memory flush
-                const usageRatio = contextStatus.currentTokens / contextStatus.maxTokens;
-                if (this.memoryFlushManager.shouldFlush(usageRatio)) {
-                    logger.info(`[AgentManager] Triggering memory flush (usage: ${(usageRatio * 100).toFixed(1)}%)`);
-                    const flushContext = {
-                        sessionId: sessionId,
-                        messages: currentMessages.map(m => ({
-                            role: m.role,
-                            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-                            timestamp: m.timestamp,
-                            metadata: m.metadata
-                        })),
-                        contextUsage: usageRatio,
-                        reason: contextStatus.needsCompression ? 'compression' : 'threshold'
-                    };
-                    await this.memoryFlushManager.flush(flushContext).catch(err => {
-                        logger.error('[AgentManager] Memory flush failed:', err);
-                    });
-                }
                 logger.info(`[AgentManager] Auto-compressing context: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
                 const compressedMessages = await this.contextGuard.autoCompress(currentMessages);
                 logger.info(`[AgentManager] Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`);
@@ -939,20 +881,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                     beforeCount: currentMessages.length,
                     afterCount: compressedMessages.length,
                 });
-                // Trigger session memory hook to save summary of compressed context
-                try {
-                    const summary = createEmptySessionSummary(sessionId, Date.now());
-                    const compressedText = currentMessages
-                        .filter(m => m.role !== 'system')
-                        .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content.slice(0, 200) : '[Complex]'}`)
-                        .join('\n');
-                    summary.summaryText = compressedText.slice(0, 3000);
-                    summary.topics = ['Context Compression'];
-                    await this.sessionMemoryHook.onSessionEnd(summary, currentMessages.length);
-                }
-                catch (err) {
-                    logger.debug('[AgentManager] Session memory hook after compression failed:', err);
-                }
+                this.activityLog.logInfo(`Context compressed: ${currentMessages.length} → ${compressedMessages.length}`).catch(() => { });
             }
             // Tool execution loop (no iteration limit)
             let iteration = 0;
@@ -971,32 +900,21 @@ If there's nothing noteworthy, respond with an empty string.`,
                         ? systemMessage.content
                         : ''
                     : '';
-                // Enrich with semantic memory (first iteration only)
+                // Enrich with memory context (first iteration only)
                 if (iteration === 1) {
                     try {
-                        const relevantCtx = await this.semanticMemory.getRelevantContext(message);
-                        if (relevantCtx.content) {
-                            systemPrompt = systemPrompt + '\n\n' + relevantCtx.content;
-                        }
+                        const memCtx = await this.memoryStore.getRelevantContext(message);
+                        if (memCtx)
+                            systemPrompt = systemPrompt + '\n\n' + memCtx;
                     }
                     catch (err) {
-                        logger.debug('[SemanticMemory] Context enrichment failed:', err);
-                    }
-                    // Inject persistent memories from MemorySystem
-                    try {
-                        const memories = await this.memorySystem.semanticSearch(message, 5);
-                        if (memories.length > 0) {
-                            const memoryContext = memories.map(m => `- **${m.entry.title}**: ${m.entry.content.slice(0, 300)}`).join('\n');
-                            systemPrompt += '\n\n## Relevant Memories\n' + memoryContext;
-                            logger.debug(`[MemorySystem] Injected ${memories.length} persistent memory(s) into prompt`);
-                        }
-                    }
-                    catch (err) {
-                        logger.debug('[MemorySystem] Memory search failed:', err);
+                        logger.debug('[MemoryStore] Context enrichment failed:', err);
                     }
                 }
-                // Filter out system message
-                const messages = context.filter((m) => m.role !== 'system');
+                // Filter out system message, then repair any orphaned tool_use blocks
+                let messages = sanitizeMessages(context.filter((m) => m.role !== 'system'));
+                // Byte-size pre-check (same reasoning as processSendMessage)
+                messages = this.stripBase64ImagesIfNeeded(messages);
                 // Get tools
                 const toolMode = this.config.agent.toolStrategy || 'auto';
                 const toolDecision = ToolUsageStrategy.analyzeMessage(message, toolMode);
@@ -1178,20 +1096,9 @@ If there's nothing noteworthy, respond with an empty string.`,
             // Record performance
             const requestDuration = requestTimer.end();
             performanceMonitor.recordRequest(requestDuration);
-            // Log to memory
+            // Log to activity log
             if (finalResponse && finalResponse.type === 'text') {
-                this.memorySystem.appendLog(sessionId, {
-                    timestamp: Date.now(),
-                    role: 'assistant',
-                    content: finalResponse.content,
-                    metadata: { executionTime: requestDuration },
-                }).catch(() => { });
-                this.dailyLogManager.logSession({
-                    id: sessionId.slice(0, 8),
-                    timeRange: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-                    summary: message.slice(0, 100),
-                    result: 'success',
-                }).catch(() => { });
+                this.activityLog.logSession(sessionId, 'end', message.slice(0, 80)).catch(() => { });
             }
             // Auto-save
             if (this.config.agent.autoSave) {
@@ -1201,7 +1108,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         }
         catch (error) {
             onStream('', `Error: ${error instanceof Error ? error.message : 'Unknown error'}`, true);
-            this.dailyLogManager.logError(error instanceof Error ? error.message : 'Unknown error in streaming').catch(() => { });
+            this.activityLog.logError(error instanceof Error ? error.message : 'Unknown error in streaming').catch(() => { });
             return this.handleError(error);
         }
     }
@@ -1258,6 +1165,34 @@ If there's nothing noteworthy, respond with an empty string.`,
      * @param error - Error object
      * @returns Error response
      */
+    /**
+     * Strip base64 image blocks from messages when the estimated JSON body would
+     * approach the ACS request-body hard limit (6 MB).
+     *
+     * WHY: Anthropic counts image tokens by dimensions (~1–5k tokens/image), but
+     * each base64 screenshot is 500KB–2MB. Token-based compression (threshold:
+     * 170k tokens) never fires when there are only 3–4 screenshots, yet bytes
+     * can already exceed 6MB. Stripping happens before the API call, so the
+     * reactive trimMessagesToBodyLimit() in ModelAPI is a last resort only.
+     */
+    stripBase64ImagesIfNeeded(messages) {
+        const BYTE_THRESHOLD = 4 * 1024 * 1024; // 4 MB — comfortable margin under 6 MB
+        const estimatedBytes = JSON.stringify(messages).length;
+        if (estimatedBytes <= BYTE_THRESHOLD)
+            return messages;
+        logger.warn(`[AgentManager] Message body ~${Math.round(estimatedBytes / 1024)}KB exceeds 4MB, stripping base64 images before API call`);
+        return messages.map((msg) => {
+            if (!Array.isArray(msg.content))
+                return msg;
+            const stripped = msg.content.map((block) => {
+                if (block?.type === 'image' && block?.source?.type === 'base64') {
+                    return { type: 'text', text: '[image stripped to fit request size limit]' };
+                }
+                return block;
+            });
+            return { ...msg, content: stripped };
+        });
+    }
     handleError(error) {
         if (error instanceof ModelAPIError) {
             logger.error(`Model API error: ${error.code} - ${error.message}`);
@@ -1281,7 +1216,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 },
             };
         }
-        logger.error('Unknown error occurred');
+        logger.error('Unknown error occurred:', String(error));
         return {
             type: 'error',
             content: 'An unknown error occurred',
@@ -1845,26 +1780,50 @@ If there's nothing noteworthy, respond with an empty string.`,
     /**
      * Get memory system
      */
-    getMemorySystem() {
-        return this.memorySystem;
-    }
-    /**
-     * Get daily log manager
-     */
-    getDailyLogManager() {
-        return this.dailyLogManager;
-    }
-    /**
-     * Get semantic memory
-     */
-    getSemanticMemory() {
-        return this.semanticMemory;
-    }
+    getMemoryStore() { return this.memoryStore; }
+    getActivityLog() { return this.activityLog; }
     /**
      * Get proactive behavior engine
      */
     getProactiveBehavior() {
         return this.proactiveBehavior;
+    }
+    /**
+     * Inject an AI-synthesized proactive message into the most recently active
+     * chat session so the user sees it in the chat UI without having to ask.
+     * Also sends a system notification as a heads-up.
+     */
+    async injectProactiveMessage(msg) {
+        // 1. System notification (always, so user is alerted even with chat closed)
+        if (typeof notification !== 'undefined') {
+            try {
+                await notification.show('🤖 助手主动提醒', msg.slice(0, 160));
+            }
+            catch { /* silent */ }
+        }
+        // 2. Inject into the most recently active session
+        try {
+            const activeSessions = this.getActiveSessions();
+            if (activeSessions.length === 0)
+                return;
+            const targetId = activeSessions[activeSessions.length - 1];
+            const session = this.sessions.get(targetId);
+            if (!session)
+                return;
+            const content = `> 🤖 **主动提醒**\n\n${msg}`;
+            session.addMessage({ role: 'assistant', content });
+            await session.save();
+            // Notify UI layer
+            this.eventBus.emit('proactiveMessage', { sessionId: targetId, content });
+            logger.info(`[Proactive] Injected message into session ${targetId.slice(0, 8)}`);
+            // 3. Also broadcast to social channels if configured
+            if (this.socialManager) {
+                this.socialManager.broadcast(`🤖 ${msg}`).catch(() => { });
+            }
+        }
+        catch (e) {
+            logger.debug('[Proactive] injectProactiveMessage failed:', e);
+        }
     }
     // ===== Plugin System API =====
     /**
@@ -1940,7 +1899,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         // After-hook: log tool executions to DailyLog
         this.toolHooksManager.onAfterToolCall('memory-logger', async (ctx) => {
             try {
-                await this.dailyLogManager.logInsight(`Tool: ${ctx.toolName} (${ctx.duration}ms) → ${ctx.isError ? 'error' : 'ok'}`);
+                await this.activityLog.logTool(ctx.toolName, ctx.duration, ctx.isError);
             }
             catch (err) {
                 logger.debug('[ToolHook:memory-logger] Failed to log:', err);
@@ -1969,7 +1928,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         // tool:after → log to DailyLog
         this.eventBus.on('tool:after', async (data) => {
             try {
-                await this.dailyLogManager.logInsight(`Tool: ${data.toolName} (${data.duration}ms)`);
+                await this.activityLog.logTool(data.toolName, data.duration, false);
             }
             catch (err) {
                 // silent
@@ -1978,7 +1937,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         // session:compress → log compression event
         this.eventBus.on('session:compress', async (data) => {
             try {
-                await this.dailyLogManager.logInsight(`Context compressed: ${data.beforeCount} → ${data.afterCount} messages (session ${data.sessionId.slice(0, 8)})`);
+                await this.activityLog.logInfo(`Context compressed: ${data.beforeCount} → ${data.afterCount} (${data.sessionId.slice(0, 8)})`);
             }
             catch (err) {
                 // silent
@@ -1987,7 +1946,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         // memory:saved → log memory event
         this.eventBus.on('memory:saved', async (data) => {
             try {
-                await this.dailyLogManager.logInsight(`Memory saved: "${data.title}" [${data.tags.join(', ')}]`);
+                await this.activityLog.logMemory(data.title, data.tags);
             }
             catch (err) {
                 // silent

@@ -12,4 +12,4 @@ export type {
   HeartbeatSchedule,
   ScheduleType,
 } from './types.js';
-export { createStatusCheckTask, createReminderTask, createCleanupTask, createDailyLogArchivalTask } from './tasks.js';
+export { createStatusCheckTask, createReminderTask, createCleanupTask } from './tasks.js';

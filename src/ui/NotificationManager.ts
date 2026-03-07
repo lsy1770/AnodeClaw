@@ -9,6 +9,9 @@
 import { logger } from '../utils/logger.js';
 
 // Anode global notification API (from NotificationAPI.kt)
+// NOTE: show() returns Boolean (success flag), NOT an Int ID.
+// The internal notification ID is managed entirely by Kotlin and not exposed to JS.
+// Use cancelAll() to dismiss our notification since we cannot cancel by ID.
 declare const notification: {
   show(title: string, content: string, options?: {
     autoCancel?: boolean;
@@ -16,10 +19,10 @@ declare const notification: {
     progress?: number | boolean;
     actions?: Array<{ title: string; onClick?: string }>;
     onClick?: string;
-  }): Promise<number>;
-  updateProgress(id: number, progress: number, max?: number): Promise<void>;
-  cancel(id: number): Promise<void>;
-  cancelAll(): Promise<void>;
+  }): Promise<boolean>;
+  updateProgress(id: number, progress: number, max?: number): Promise<boolean>;
+  cancel(id: number): Promise<boolean>;
+  cancelAll(): Promise<boolean>;
   readonly isEnabled: boolean;
 };
 
@@ -53,7 +56,6 @@ declare const ui: {
  * Integrates with Anode NotificationAPI and FloatingWindowAPI.
  */
 export class NotificationManager {
-  private notificationId: number | null = null;
   private isActive: boolean = false;
   private quickMsgWindowCreated: boolean = false;
 
@@ -76,7 +78,7 @@ export class NotificationManager {
     }
 
     try {
-      this.notificationId = await notification.show(
+      await notification.show(
         'Anode ClawdBot',
         '点击打开 AI 助手',
         {
@@ -89,7 +91,7 @@ export class NotificationManager {
       );
 
       this.isActive = true;
-      logger.info(`[NotificationManager] Notification shown (id: ${this.notificationId})`);
+      logger.info(`[NotificationManager] Notification shown`);
     } catch (error) {
       logger.error('[NotificationManager] Failed to show notification:', error);
       throw error;
@@ -100,13 +102,14 @@ export class NotificationManager {
    * Hide notification
    */
   async hide(): Promise<void> {
-    if (this.notificationId === null || !this.isActive) {
+    if (!this.isActive) {
       return;
     }
 
     try {
-      await notification.cancel(this.notificationId);
-      this.notificationId = null;
+      // Kotlin NotificationAPI doesn't expose notification IDs to JS,
+      // so we use cancelAll() to dismiss our persistent notification.
+      await notification.cancelAll();
       this.isActive = false;
       logger.info('[NotificationManager] Notification hidden');
     } catch (error) {
@@ -118,13 +121,13 @@ export class NotificationManager {
    * Update notification message text
    */
   async update(message: string): Promise<void> {
-    if (this.notificationId === null || !this.isActive) {
+    if (!this.isActive) {
       return;
     }
 
     try {
-      // Re-show with updated content (Anode notification API updates via re-show)
-      this.notificationId = await notification.show(
+      // Re-show with updated content (creates a new notification; Kotlin manages IDs internally)
+      await notification.show(
         'Anode ClawdBot',
         message,
         {
@@ -146,14 +149,10 @@ export class NotificationManager {
    */
   async showProgress(title: string, progress: number, max: number = 100): Promise<void> {
     try {
-      if (this.notificationId !== null) {
-        await notification.updateProgress(this.notificationId, progress, max);
-      } else {
-        this.notificationId = await notification.show(title, `${progress}/${max}`, {
-          progress,
-          autoCancel: false,
-        });
-      }
+      await notification.show(title, `${progress}/${max}`, {
+        progress,
+        autoCancel: false,
+      });
     } catch (error) {
       logger.error('[NotificationManager] Failed to show progress:', error);
     }
@@ -164,18 +163,18 @@ export class NotificationManager {
    */
   async showMessage(title: string, message: string, duration: number = 3000): Promise<void> {
     try {
-      const msgId = await notification.show(title, message, {
+      await notification.show(title, message, {
         autoCancel: true,
         bigText: message,
       });
 
-      // Auto-cancel after duration
+      // Auto-cancel after duration (cancelAll is the only option since Kotlin doesn't expose IDs)
       if (duration > 0) {
         setTimeout(async () => {
           try {
-            await notification.cancel(msgId);
+            await notification.cancelAll();
           } catch {
-            // Ignore cancel errors (may already be dismissed)
+            // Ignore cancel errors
           }
         }, duration);
       }

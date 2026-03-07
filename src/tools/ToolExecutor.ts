@@ -20,6 +20,12 @@ import { ToolRegistry } from './ToolRegistry.js';
 import { logger } from '../utils/logger.js';
 import { SecurityUtils } from '../utils/security.js';
 
+// Timer API global (for proper setTimeout in Anode environment)
+declare const timer: {
+  setTimeout(callback: string, delay: number): Promise<string>;
+  clearTimeout(taskId: string): Promise<boolean>;
+};
+
 /**
  * Tool execution error
  */
@@ -43,7 +49,7 @@ export class ToolExecutor {
   private defaultTimeout: number;
   private executionCount: number;
 
-  constructor(registry: ToolRegistry, defaultTimeout: number = 30000) {
+  constructor(registry: ToolRegistry, defaultTimeout: number = 10000) {  // 10s timeout for faster debugging
     this.registry = registry;
     this.defaultTimeout = defaultTimeout;
     this.executionCount = 0;
@@ -62,9 +68,11 @@ export class ToolExecutor {
     this.executionCount++;
 
     logger.info(`Executing tool: ${toolCall.name} (call ID: ${toolCall.id})`);
+    logger.debug(`[ToolExecutor] Step 1: Starting execution`);
 
     try {
       // Get tool from registry
+      logger.debug(`[ToolExecutor] Step 2: Getting tool from registry`);
       const tool = this.registry.get(toolCall.name);
       if (!tool) {
         throw new ToolExecutionError(
@@ -75,19 +83,23 @@ export class ToolExecutor {
       }
 
       // Check permissions
+      logger.debug(`[ToolExecutor] Step 3: Checking permissions`);
       if (tool.permissions && options?.context?.permissions) {
         this.checkPermissions(tool, options.context);
       }
 
       // Validate parameters
+      logger.debug(`[ToolExecutor] Step 4: Validating parameters`);
       await this.validateParameters(tool, toolCall.input);
 
       // Security checks: path validation and input sanitization
+      logger.debug(`[ToolExecutor] Step 5: Security checks`);
       this.performSecurityChecks(tool, toolCall.input);
 
-      // Execute with timeout
-      const timeout = options?.timeout ?? this.defaultTimeout;
-      const result = await this.executeWithTimeout(tool, toolCall.input, timeout, options);
+      // Execute tool directly (Promise.race causes issues in Anode environment)
+      logger.debug(`[ToolExecutor] Step 6: Calling tool.execute()`);
+      const result = await tool.execute(toolCall.input, options);
+      logger.debug(`[ToolExecutor] Step 7: tool.execute() returned`);
 
       // Add metadata
       const duration = Date.now() - startTime;
@@ -98,16 +110,20 @@ export class ToolExecutor {
         timestamp: Date.now(),
       };
 
-      logger.info(`Tool executed successfully: ${toolCall.name} (${duration}ms)`);
-
-      // Debug: Log actual result output for troubleshooting
-      let outputPreview = '';
-      if (result.output === undefined || result.output === null) {
-        outputPreview = String(result.output);
-      } else if (typeof result.output === 'string') {
-        outputPreview = result.output.slice(0, 200);
+      if (result.success) {
+        logger.info(`Tool executed successfully: ${toolCall.name} (${duration}ms)`);
       } else {
-        outputPreview = JSON.stringify(result.output).slice(0, 200);
+        logger.warn(`Tool returned failure: ${toolCall.name} (${duration}ms) — ${result.error?.message ?? 'no message'}`);
+      }
+
+      // Debug: Log result for troubleshooting
+      let outputPreview: string;
+      if (result.output !== undefined && result.output !== null) {
+        outputPreview = typeof result.output === 'string' ? result.output.slice(0, 200) : JSON.stringify(result.output).slice(0, 200);
+      } else if (!result.success && result.error) {
+        outputPreview = `[error] ${result.error.code}: ${result.error.message}`;
+      } else {
+        outputPreview = '(no output)';
       }
       logger.debug(`Tool result: ${outputPreview}${outputPreview.length >= 200 ? '...' : ''}`);
 
@@ -208,7 +224,9 @@ export class ToolExecutor {
   }
 
   /**
-   * Execute tool with timeout protection
+   * Execute tool with timeout protection using Promise.race
+   *
+   * Uses Promise.race + setTimeout for clean timeout handling
    */
   private async executeWithTimeout(
     tool: Tool,
@@ -216,8 +234,12 @@ export class ToolExecutor {
     timeout: number,
     options?: ToolExecutionOptions
   ): Promise<ToolResult> {
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
+    logger.debug(`[executeWithTimeout] Starting: ${tool.name}, timeout: ${timeout}ms`);
+
+    // Create timeout promise
+    const timeoutPromise = new Promise<ToolResult>((_, reject) => {
+      setTimeout(() => {
+        logger.warn(`[executeWithTimeout] TIMEOUT triggered for ${tool.name} after ${timeout}ms`);
         reject(
           new ToolExecutionError(
             `Tool execution timeout after ${timeout}ms`,
@@ -226,18 +248,18 @@ export class ToolExecutor {
           )
         );
       }, timeout);
-
-      tool
-        .execute(params, options)
-        .then((result) => {
-          clearTimeout(timeoutId);
-          resolve(result);
-        })
-        .catch((error) => {
-          clearTimeout(timeoutId);
-          reject(error);
-        });
     });
+
+    logger.debug(`[executeWithTimeout] Starting Promise.race for ${tool.name}`);
+
+    // Race between tool execution and timeout
+    const result = await Promise.race([
+      tool.execute(params, options),
+      timeoutPromise
+    ]);
+
+    logger.debug(`[executeWithTimeout] Promise.race resolved for ${tool.name}`);
+    return result;
   }
 
   /**

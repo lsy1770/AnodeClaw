@@ -52,6 +52,16 @@ async function main() {
         logger.info('  [Social] Social platform integration (Telegram, Feishu, DingTalk, QQ, WeChat)');
         logger.info('  [Social] Multi-platform adapter framework');
         logger.info('Initialization successful');
+        // 🔥 关键修复：保持事件循环运行
+        // ClawdBot 需要永久运行以处理异步工具执行（auto.isEnabled() 等 ACS API 返回 Promise）
+        // 如果脚本退出，LoopScriptEngine 的 while 循环会停止，eventLoopQueue.executeQueue() 不会被调用
+        // 导致所有 Promise 永远不会 resolve
+        logger.info('🔄 Starting event loop keep-alive...');
+        setInterval(() => {
+            // 空操作，仅用于保持脚本运行和事件循环活跃
+            // LoopScriptEngine 会在 while 循环中不断调用 eventLoopQueue.executeQueue()
+        }, 60000); // 每分钟触发一次（频率不重要，关键是保持脚本运行）
+        logger.info('✅ Event loop is now active and will keep running');
         // Example usage (uncomment to test with real API key):
         /*
         logger.info('Creating test session...');

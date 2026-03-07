@@ -1,427 +1,394 @@
 /**
- * Proactive Behavior
+ * Proactive Behavior — AI-Driven Environmental Intelligence
  *
- * AI-driven suggestion engine that analyzes daily logs, task history,
- * and context to generate actionable insights. Combines heuristic checks
- * with optional AI-powered analysis for deeper insights.
+ * The agent actively perceives its Android environment and synthesizes
+ * everything with the AI model to decide what's worth telling the user.
+ *
+ * Sensor pipeline (runs every N minutes):
+ *   Screen OCR → Notifications → Device state → Task state → Memories
+ *             ↓ (all fed into one prompt)
+ *         AI analysis
+ *             ↓
+ *   Inject into chat / system notification
+ *
+ * Design principles:
+ * - AI does the heavy lifting — no hand-coded heuristics for "what matters"
+ * - Screen content is read via OCR (PP-OCRv3, silent capture)
+ * - Only trigger AI call when something has actually changed
+ * - Prevent spam via per-topic cooldowns and minimum intervals
  */
 import { EventEmitter } from 'events';
 import { logger } from '../../utils/logger.js';
+const DEFAULT_WATCHED_PACKAGES = [
+    'com.tencent.mm', // WeChat
+    'com.tencent.mobileqq', // QQ
+    'org.telegram.messenger', // Telegram
+    'com.whatsapp', // WhatsApp
+    'com.android.mms', // SMS
+    'com.android.phone', // Phone
+];
 const DEFAULT_CONFIG = {
     enabled: true,
     checkInterval: 15 * 60 * 1000,
+    fastCheckInterval: 3 * 60 * 1000,
     quietHoursStart: 23,
     quietHoursEnd: 7,
     repeatThreshold: 5,
     idleSessionTimeout: 2 * 60 * 60 * 1000,
+    minAIInterval: 5 * 60 * 1000,
+    batteryThreshold: 20,
+    watchedPackages: DEFAULT_WATCHED_PACKAGES,
+    maxScreenTextChars: 800,
 };
-/**
- * ProactiveBehavior Class
- *
- * Emits a `'suggestions'` event with an array of ProactiveSuggestion
- * whenever new suggestions are generated.
- */
+// ─── Class ───────────────────────────────────────────────────────────────────
 export class ProactiveBehavior extends EventEmitter {
-    constructor(config, memorySystem, dailyLogManager, getActiveSessions) {
+    constructor(config, memoryStore, getActiveSessions) {
         super();
-        /** Track recently sent notifications to prevent spam */
-        this.recentNotifications = new Map();
-        /** Cooldown period for notifications (1 hour) */
-        this.NOTIFICATION_COOLDOWN = 60 * 60 * 1000;
-        /** Optional AI insight generator callback */
-        this.aiInsightGenerator = null;
-        /** Last AI insight timestamp (to rate limit AI calls) */
-        this.lastAIInsightTime = 0;
-        /** Minimum interval between AI insight calls (1 hour) */
-        this.AI_INSIGHT_INTERVAL = 60 * 60 * 1000;
+        // AI generator provided by AgentManager
+        this.aiGenerator = null;
+        // Dedup state
+        this.seenNotificationKeys = new Set();
+        this.lastScreenHash = '';
+        this.lastAICallTime = 0;
+        this.lastBatteryAlertLevel = 100;
+        // Per-topic cooldown to prevent repeated identical messages
+        this.recentMessages = new Map();
+        this.MESSAGE_COOLDOWN = 30 * 60 * 1000; // 30 min
         this.config = { ...DEFAULT_CONFIG, ...config };
-        this.memorySystem = memorySystem;
-        this.dailyLogManager = dailyLogManager;
+        this.memoryStore = memoryStore;
         this.getActiveSessions = getActiveSessions;
     }
-    /**
-     * Set the AI insight generator callback
-     * This is called by AgentManager after initialization
-     */
     setAIInsightGenerator(generator) {
-        this.aiInsightGenerator = generator;
-        logger.info('[Proactive] AI insight generator registered');
+        this.aiGenerator = generator;
+        logger.info('[Proactive] AI generator registered');
     }
+    // ─── Public API ──────────────────────────────────────────────────────────
     /**
-     * Run all heuristic checks and return suggestions
+     * Fast sensor check (every 3 min).
+     * Gathers environment, runs AI synthesis if something changed.
      */
-    async check() {
-        if (!this.config.enabled)
-            return [];
-        if (this.isQuietHours()) {
-            logger.debug('[Proactive] Quiet hours — skipping checks');
-            return [];
-        }
-        let suggestions = [];
+    async fastCheck() {
+        if (!this.config.enabled || this.isQuietHours())
+            return;
         try {
-            // Run heuristic checks in parallel
-            const [pending, repeated, idle, errors] = await Promise.all([
-                this.checkPendingTasks(),
-                this.checkRepeatedPatterns(),
-                this.checkIdleSessions(),
-                this.checkErrorPatterns(),
-            ]);
-            suggestions.push(...pending, ...repeated, ...idle, ...errors);
-            // Try to generate AI insights (rate-limited internally)
-            const aiInsights = await this.generateAIInsights();
-            suggestions.push(...aiInsights);
-            // Deduplicate - filter out recently sent notifications
-            suggestions = this.deduplicateSuggestions(suggestions);
+            const snap = await this.gatherSnapshot();
+            await this.synthesizeAndDeliver(snap);
         }
         catch (err) {
-            logger.warn('[Proactive] Check failed:', err);
+            logger.warn('[Proactive] fastCheck error:', err);
         }
-        if (suggestions.length > 0) {
-            this.emit('suggestions', suggestions);
-            logger.info(`[Proactive] Generated ${suggestions.length} suggestion(s)`);
-        }
-        return suggestions;
     }
     /**
-     * Analyze a completed task and return follow-up suggestions
+     * Full check (every 15 min) — same as fast but always includes memory analysis
+     * even if screen hasn't changed.
+     */
+    async check() {
+        if (!this.config.enabled || this.isQuietHours())
+            return [];
+        try {
+            const snap = await this.gatherSnapshot();
+            const msg = await this.synthesizeAndDeliver(snap, /* forceAI */ true);
+            if (!msg)
+                return [];
+            return [{
+                    type: 'insight',
+                    title: '主动提醒',
+                    description: msg,
+                    priority: 'medium',
+                    timestamp: Date.now(),
+                }];
+        }
+        catch (err) {
+            logger.warn('[Proactive] check error:', err);
+            return [];
+        }
+    }
+    /**
+     * After task completion — quick AI summary based on what happened.
      */
     async analyzeTaskCompletion(task, result) {
         if (!this.config.enabled)
             return [];
-        const suggestions = [];
-        if (result === 'failure') {
-            suggestions.push({
-                type: 'follow-up',
-                title: 'Task failed',
-                description: `The task "${task.slice(0, 60)}" failed. Consider retrying or investigating the error.`,
-                priority: 'medium',
-                timestamp: Date.now(),
-            });
-        }
-        if (result === 'success') {
-            // Check if user frequently runs similar tasks — suggest automation
-            try {
-                const recentLogs = await this.dailyLogManager.getRecentLogs(7);
-                const allCompleted = recentLogs.flatMap(l => l.tasksCompleted);
-                const similar = allCompleted.filter(t => this.textSimilarity(t, task) > 0.5);
-                if (similar.length >= this.config.repeatThreshold) {
-                    suggestions.push({
-                        type: 'optimization',
-                        title: 'Repeated task detected',
-                        description: `"${task.slice(0, 40)}" has been completed ${similar.length} times recently. Consider automating it.`,
-                        priority: 'low',
-                        timestamp: Date.now(),
-                    });
-                }
-            }
-            catch {
-                // non-critical
-            }
-        }
-        if (suggestions.length > 0) {
-            this.emit('suggestions', suggestions);
-        }
-        return suggestions;
+        const prompt = `## 任务完成通知\n` +
+            `任务："${task.slice(0, 100)}"\n` +
+            `结果：${result === 'success' ? '✅ 成功' : '❌ 失败'}\n\n` +
+            `请用一句话告知用户任务结果，并根据结果给出下一步建议（如果失败，建议排查方向）。` +
+            `如果结果对用户没有实际价值，回复 NO_MESSAGE。`;
+        const msg = await this.callAI(prompt);
+        if (!msg)
+            return [];
+        const suggestion = {
+            type: result === 'success' ? 'follow-up' : 'warning',
+            title: result === 'success' ? '任务完成' : '任务失败',
+            description: msg,
+            priority: result === 'success' ? 'low' : 'medium',
+            timestamp: Date.now(),
+        };
+        this.emit('suggestions', [suggestion]);
+        return [suggestion];
     }
-    /**
-     * Create a heartbeat task config for periodic proactive checks
-     */
+    // ─── Heartbeat factories ─────────────────────────────────────────────────
     createHeartbeatTask() {
         return {
             id: 'builtin:proactive-check',
-            name: 'Proactive Behavior Check',
-            description: 'Periodically checks for pending tasks, repeated patterns, idle sessions, and error patterns',
-            schedule: {
-                type: 'interval',
-                interval: this.config.checkInterval,
-            },
+            name: 'Proactive Full Check',
+            description: 'AI-driven full environment analysis every 15 min',
+            schedule: { type: 'interval', interval: this.config.checkInterval },
             enabled: this.config.enabled,
-            handler: async () => {
-                await this.check();
-            },
-            onError: (error) => {
-                logger.error('[Proactive] Heartbeat task error:', error.message);
-            },
+            handler: async () => { await this.check(); },
+            onError: (e) => logger.error('[Proactive] full check error:', e.message),
         };
     }
-    // ===== Heuristic check methods =====
+    createFastHeartbeatTask() {
+        return {
+            id: 'builtin:proactive-fast',
+            name: 'Proactive Fast Sensor Check',
+            description: 'Screen OCR + notifications + battery check every 3 min',
+            schedule: { type: 'interval', interval: this.config.fastCheckInterval },
+            enabled: this.config.enabled,
+            handler: async () => { await this.fastCheck(); },
+            onError: (e) => logger.error('[Proactive] fast check error:', e.message),
+        };
+    }
+    // ─── Core: gather → synthesize → deliver ─────────────────────────────────
     /**
-     * Check for pending tasks and generate reminders
+     * Collect all sensors in parallel.
      */
-    async checkPendingTasks() {
-        const suggestions = [];
+    async gatherSnapshot() {
+        const [screenResult, notifResult, batteryResult, taskResult, memResult] = await Promise.allSettled([
+            this.captureScreenText(),
+            this.getWatchedNotifications(),
+            this.getBattery(),
+            this.memoryStore.loadTaskState(),
+            this.memoryStore.search('recent task memory', { limit: 4 }),
+        ]);
+        const screenText = screenResult.status === 'fulfilled' ? screenResult.value : '';
+        const rawNotifs = notifResult.status === 'fulfilled' ? notifResult.value : [];
+        const battery = batteryResult.status === 'fulfilled' ? batteryResult.value : null;
+        const task = taskResult.status === 'fulfilled' ? taskResult.value : null;
+        const mems = memResult.status === 'fulfilled' ? memResult.value : [];
+        // Sync the seen-notification set: remove dismissed ones
+        const currentKeys = new Set(rawNotifs.map(n => n.key));
+        for (const k of this.seenNotificationKeys) {
+            if (!currentKeys.has(k))
+                this.seenNotificationKeys.delete(k);
+        }
+        // Only surface NEW notifications
+        const newNotifs = rawNotifs.filter(n => !this.seenNotificationKeys.has(n.key));
+        for (const n of newNotifs)
+            this.seenNotificationKeys.add(n.key);
+        const notifications = newNotifs.map(n => ({
+            app: n.appName || n.packageName.split('.').pop() || n.packageName,
+            title: n.title ?? '',
+            body: (n.text ?? n.subText ?? '').slice(0, 100),
+            key: n.key,
+            time: n.time,
+        }));
+        let screenOn = true;
         try {
-            const pending = await this.dailyLogManager.getPendingTasks();
-            if (pending.length > 0) {
-                suggestions.push({
-                    type: 'reminder',
-                    title: `${pending.length} pending task(s)`,
-                    description: `You have ${pending.length} pending task(s): ${pending.slice(0, 3).join(', ')}${pending.length > 3 ? '...' : ''}`,
-                    priority: pending.length >= 5 ? 'high' : 'medium',
-                    timestamp: Date.now(),
-                });
-            }
+            if (typeof device !== 'undefined')
+                screenOn = device.isScreenOn();
         }
-        catch (err) {
-            logger.debug('[Proactive] checkPendingTasks failed:', err);
-        }
-        return suggestions;
+        catch { /* ignore */ }
+        return {
+            screenText,
+            screenOn,
+            notifications,
+            battery,
+            taskSummary: task?.taskSummary ?? null,
+            taskNextSteps: task?.nextSteps ?? [],
+            recentMemories: mems.map(r => ({
+                title: r.entry.title,
+                snippet: r.entry.content.slice(0, 120),
+            })),
+            timestamp: Date.now(),
+        };
     }
     /**
-     * Check for repeated patterns in recent activity
+     * Decide whether to run AI, build prompt, call AI, deliver result.
+     * Returns the message delivered (or null).
      */
-    async checkRepeatedPatterns() {
-        const suggestions = [];
-        try {
-            const recentLogs = await this.dailyLogManager.getRecentLogs(7);
-            const allCompleted = recentLogs.flatMap(l => l.tasksCompleted);
-            // Count similar tasks
-            const taskCounts = new Map();
-            for (const task of allCompleted) {
-                const normalized = task.toLowerCase().trim();
-                // Group similar tasks
-                let foundKey = false;
-                for (const [key, count] of taskCounts) {
-                    if (this.textSimilarity(key, normalized) > 0.6) {
-                        taskCounts.set(key, count + 1);
-                        foundKey = true;
-                        break;
-                    }
-                }
-                if (!foundKey) {
-                    taskCounts.set(normalized, 1);
-                }
-            }
-            for (const [task, count] of taskCounts) {
-                if (count >= this.config.repeatThreshold) {
-                    suggestions.push({
-                        type: 'optimization',
-                        title: 'Repeated task pattern',
-                        description: `"${task.slice(0, 50)}" has been done ${count} times this week. Consider creating an automation or macro.`,
-                        priority: 'low',
-                        timestamp: Date.now(),
-                    });
-                }
-            }
+    async synthesizeAndDeliver(snap, forceAI = false) {
+        if (!this.aiGenerator)
+            return null;
+        // Determine if something changed since last check
+        const screenHash = snap.screenText.slice(0, 200);
+        const hasNewNotifs = snap.notifications.length > 0;
+        const screenChanged = screenHash !== this.lastScreenHash;
+        const hasLowBattery = snap.battery && !snap.battery.isCharging
+            && snap.battery.level < this.config.batteryThreshold
+            && snap.battery.level <= this.lastBatteryAlertLevel - 5;
+        if (hasLowBattery && snap.battery) {
+            this.lastBatteryAlertLevel = snap.battery.level;
         }
-        catch (err) {
-            logger.debug('[Proactive] checkRepeatedPatterns failed:', err);
+        const somethingChanged = hasNewNotifs || screenChanged || hasLowBattery || forceAI;
+        if (!somethingChanged) {
+            logger.debug('[Proactive] Nothing changed, skipping AI call');
+            return null;
         }
-        return suggestions;
-    }
-    /**
-     * Check for idle sessions
-     */
-    async checkIdleSessions() {
-        const suggestions = [];
-        const activeSessions = this.getActiveSessions();
-        if (activeSessions.length > 3) {
-            suggestions.push({
-                type: 'warning',
-                title: 'Many active sessions',
-                description: `${activeSessions.length} sessions are active. Consider closing unused sessions to free resources.`,
-                priority: 'low',
-                timestamp: Date.now(),
-            });
-        }
-        return suggestions;
-    }
-    /**
-     * Check for repeated error patterns
-     */
-    async checkErrorPatterns() {
-        const suggestions = [];
-        try {
-            const todayLog = await this.dailyLogManager.getTodayLog();
-            const errors = todayLog.errors;
-            if (errors.length >= 3) {
-                // Look for repeated error messages
-                const errorCounts = new Map();
-                for (const err of errors) {
-                    const msg = err.replace(/^\d{2}:\d{2}:\s*/, '').toLowerCase().trim();
-                    const normalized = msg.slice(0, 80);
-                    errorCounts.set(normalized, (errorCounts.get(normalized) || 0) + 1);
-                }
-                for (const [errMsg, count] of errorCounts) {
-                    if (count >= 2) {
-                        suggestions.push({
-                            type: 'warning',
-                            title: `Repeated error (x${count})`,
-                            description: `Error "${errMsg.slice(0, 60)}" occurred ${count} times today. This may need investigation.`,
-                            priority: 'high',
-                            timestamp: Date.now(),
-                        });
-                    }
-                }
-            }
-            if (errors.length >= 5) {
-                suggestions.push({
-                    type: 'warning',
-                    title: `High error rate (${errors.length})`,
-                    description: `${errors.length} errors recorded today. System stability may be affected.`,
-                    priority: 'high',
-                    timestamp: Date.now(),
-                });
-            }
-        }
-        catch (err) {
-            logger.debug('[Proactive] checkErrorPatterns failed:', err);
-        }
-        return suggestions;
-    }
-    /**
-     * Generate AI-powered insights based on recent activity
-     * Rate-limited to avoid excessive API calls
-     */
-    async generateAIInsights() {
-        if (!this.aiInsightGenerator) {
-            logger.debug('[Proactive] AI insight generator not available');
-            return [];
-        }
-        // Rate limit AI calls
+        // Rate-limit AI calls
         const now = Date.now();
-        if (now - this.lastAIInsightTime < this.AI_INSIGHT_INTERVAL) {
-            logger.debug('[Proactive] AI insight rate limited, skipping');
-            return [];
+        if (now - this.lastAICallTime < this.config.minAIInterval && !forceAI) {
+            logger.debug('[Proactive] AI rate-limited');
+            return null;
         }
-        try {
-            // Build context from recent activity
-            const context = await this.buildAIContext();
-            if (!context) {
-                return [];
-            }
-            logger.info('[Proactive] Generating AI insights...');
-            const insight = await this.aiInsightGenerator(context);
-            this.lastAIInsightTime = now;
-            if (!insight || insight.trim().length === 0) {
-                return [];
-            }
-            // Parse the AI response into suggestions
-            return this.parseAIInsight(insight);
-        }
-        catch (err) {
-            logger.warn('[Proactive] AI insight generation failed:', err);
-            return [];
-        }
-    }
-    /**
-     * Build context string for AI analysis
-     */
-    async buildAIContext() {
-        try {
-            const todayLog = await this.dailyLogManager.getTodayLog();
-            const recentLogs = await this.dailyLogManager.getRecentLogs(3);
-            // Skip if no meaningful activity
-            if (todayLog.sessions.length === 0 && todayLog.tasksCompleted.length === 0) {
+        this.lastScreenHash = screenHash;
+        const prompt = this.buildPrompt(snap);
+        const msg = await this.callAI(prompt);
+        if (!msg)
+            return null;
+        // Dedup: don't send nearly identical messages within cooldown
+        const msgKey = msg.slice(0, 60);
+        if (this.recentMessages.has(msgKey)) {
+            const lastSent = this.recentMessages.get(msgKey);
+            if (now - lastSent < this.MESSAGE_COOLDOWN) {
+                logger.debug('[Proactive] Duplicate message suppressed');
                 return null;
             }
-            const lines = [];
-            lines.push('# Recent Activity Summary');
-            lines.push('');
-            // Today's activity
-            lines.push('## Today');
-            if (todayLog.sessions.length > 0) {
-                lines.push(`Sessions: ${todayLog.sessions.length}`);
-                for (const s of todayLog.sessions.slice(-3)) {
-                    lines.push(`- ${s.timeRange}: ${s.summary} (${s.result})`);
-                }
+        }
+        this.recentMessages.set(msgKey, now);
+        // Clean expired cooldowns
+        for (const [k, t] of this.recentMessages) {
+            if (now - t > this.MESSAGE_COOLDOWN)
+                this.recentMessages.delete(k);
+        }
+        // Deliver
+        this.emit('proactiveMessage', msg);
+        this.emit('suggestions', [{
+                type: 'insight',
+                title: '主动提醒',
+                description: msg,
+                priority: hasNewNotifs || hasLowBattery ? 'high' : 'medium',
+                timestamp: now,
+            }]);
+        logger.info('[Proactive] Delivered proactive message');
+        return msg;
+    }
+    // ─── Prompt builder ───────────────────────────────────────────────────────
+    buildPrompt(snap) {
+        const sections = [];
+        sections.push('你是用户Android手机上的智能助手，正在后台主动感知设备环境。\n' +
+            '请根据以下实时信息，判断是否有需要主动告知用户的内容。\n' +
+            '**重要规则**：只在有真正有用、用户希望知道的信息时才发送消息；如无必要，回复 NO_MESSAGE。\n');
+        // Screen
+        if (snap.screenOn && snap.screenText.trim()) {
+            const text = snap.screenText.slice(0, this.config.maxScreenTextChars);
+            sections.push(`## 当前屏幕内容（OCR）\n${text}`);
+        }
+        else if (!snap.screenOn) {
+            sections.push('## 当前屏幕\n屏幕已关闭（息屏状态）');
+        }
+        // Notifications
+        if (snap.notifications.length > 0) {
+            const lines = snap.notifications.slice(0, 5).map(n => `• [${n.app}]${n.title ? ` ${n.title}：` : ' '}${n.body}`);
+            if (snap.notifications.length > 5)
+                lines.push(`  …及其他 ${snap.notifications.length - 5} 条`);
+            sections.push(`## 新收到的消息通知\n${lines.join('\n')}`);
+        }
+        // Battery
+        if (snap.battery) {
+            const status = snap.battery.isCharging ? '充电中' : '未充电';
+            sections.push(`## 设备状态\n电量：${snap.battery.level}%（${status}）`);
+        }
+        // Current task
+        if (snap.taskSummary) {
+            const steps = snap.taskNextSteps.length > 0
+                ? `\n待处理：${snap.taskNextSteps.slice(0, 3).join('、')}`
+                : '';
+            sections.push(`## 当前任务\n${snap.taskSummary.slice(0, 200)}${steps}`);
+        }
+        // Recent memories
+        if (snap.recentMemories.length > 0) {
+            const lines = snap.recentMemories.map(m => `• ${m.title}：${m.snippet}`);
+            sections.push(`## 近期记忆摘要\n${lines.join('\n')}`);
+        }
+        sections.push('---\n' +
+            '## 分析要点\n' +
+            '请综合以上信息，考虑以下几类情况：\n' +
+            '1. **消息回复**：有未读消息需要用户关注或回复？\n' +
+            '2. **屏幕内容**：屏幕上有验证码、弹窗、需要操作的内容？\n' +
+            '3. **任务进展**：当前任务有可以继续的步骤，或需要总结的进展？\n' +
+            '4. **设备状态**：低电量或其他需要用户注意的设备状态？\n' +
+            '5. **主动建议**：根据用户的历史习惯和当前情境，有什么实用的主动建议？\n\n' +
+            '如果有值得通知的内容，请输出一条**简洁、直接、有行动建议**的中文消息（不超过150字）。\n' +
+            '消息要像一个贴心助手说话的语气，而不是系统通知。\n' +
+            '如果没有值得通知的内容，只输出：NO_MESSAGE');
+        return sections.join('\n\n');
+    }
+    // ─── Sensors ──────────────────────────────────────────────────────────────
+    async captureScreenText() {
+        if (typeof image === 'undefined' || typeof ocr === 'undefined')
+            return '';
+        try {
+            // Initialize OCR if needed (PP-OCRv3)
+            if (!ocr.isInitialized()) {
+                await ocr.init();
             }
-            if (todayLog.tasksCompleted.length > 0) {
-                lines.push(`Completed tasks: ${todayLog.tasksCompleted.join(', ')}`);
-            }
-            if (todayLog.tasksPending.length > 0) {
-                lines.push(`Pending tasks: ${todayLog.tasksPending.join(', ')}`);
-            }
-            if (todayLog.errors.length > 0) {
-                lines.push(`Errors today: ${todayLog.errors.length}`);
-            }
-            // Recent patterns
-            const allCompleted = recentLogs.flatMap(l => l.tasksCompleted);
-            if (allCompleted.length > 0) {
-                lines.push('');
-                lines.push('## Recent Tasks (last 3 days)');
-                lines.push(allCompleted.slice(-10).join(', '));
-            }
-            return lines.join('\n');
+            const bitmap = await image.captureScreenWithAccessibility(0, 4000);
+            if (!bitmap)
+                return '';
+            const text = await ocr.recognizeText(bitmap, 0.5);
+            // Normalize: collapse blank lines, trim
+            return (text ?? '')
+                .split('\n')
+                .map(l => l.trim())
+                .filter(l => l.length > 0)
+                .join('\n');
         }
         catch (err) {
-            logger.debug('[Proactive] buildAIContext failed:', err);
+            logger.debug('[Proactive] OCR failed:', err);
+            return '';
+        }
+    }
+    async getWatchedNotifications() {
+        if (typeof notificationListener === 'undefined')
+            return [];
+        if (!notificationListener.isEnabled || !notificationListener.isConnected)
+            return [];
+        if (this.config.watchedPackages.length === 0)
+            return [];
+        try {
+            const all = await notificationListener.getActiveNotifications();
+            const watched = new Set(this.config.watchedPackages);
+            return all.filter(n => watched.has(n.packageName));
+        }
+        catch {
+            return [];
+        }
+    }
+    async getBattery() {
+        if (typeof device === 'undefined')
+            return null;
+        try {
+            return await device.getBatteryInfo();
+        }
+        catch {
             return null;
         }
     }
-    /**
-     * Parse AI response into ProactiveSuggestion array
-     */
-    parseAIInsight(insight) {
-        const suggestions = [];
-        const trimmed = insight.trim();
-        if (trimmed) {
-            // Use first sentence or first 60 chars as title for better dedup
-            const firstSentence = trimmed.split(/[.!?。！？\n]/)[0]?.trim() || 'AI Insight';
-            suggestions.push({
-                type: 'insight',
-                title: firstSentence.slice(0, 60),
-                description: trimmed.slice(0, 500),
-                priority: 'medium',
-                timestamp: Date.now(),
-            });
+    // ─── AI call ──────────────────────────────────────────────────────────────
+    async callAI(prompt) {
+        if (!this.aiGenerator)
+            return null;
+        try {
+            this.lastAICallTime = Date.now();
+            logger.info('[Proactive] Calling AI for environmental analysis…');
+            const raw = await this.aiGenerator(prompt);
+            if (!raw || raw.trim() === 'NO_MESSAGE')
+                return null;
+            return raw.trim();
         }
-        return suggestions;
+        catch (err) {
+            logger.warn('[Proactive] AI call failed:', err);
+            return null;
+        }
     }
-    /**
-     * Deduplicate suggestions by checking recent notification history
-     * Prevents the same notification from being sent within the cooldown period
-     */
-    deduplicateSuggestions(suggestions) {
-        const now = Date.now();
-        const result = [];
-        // Clean up expired entries
-        for (const [key, timestamp] of this.recentNotifications) {
-            if (now - timestamp > this.NOTIFICATION_COOLDOWN) {
-                this.recentNotifications.delete(key);
-            }
-        }
-        // Filter out recently sent notifications
-        // Key includes type + title + description prefix to distinguish similar suggestions
-        for (const suggestion of suggestions) {
-            const descKey = suggestion.description.slice(0, 40);
-            const key = `${suggestion.type}:${suggestion.title}:${descKey}`;
-            if (!this.recentNotifications.has(key)) {
-                result.push(suggestion);
-                this.recentNotifications.set(key, now);
-            }
-            else {
-                logger.debug(`[Proactive] Skipping duplicate notification: ${suggestion.title}`);
-            }
-        }
-        return result;
-    }
-    // ===== Utility methods =====
-    /**
-     * Check if current time is within quiet hours
-     */
+    // ─── Utilities ────────────────────────────────────────────────────────────
     isQuietHours() {
         const hour = new Date().getHours();
         const { quietHoursStart, quietHoursEnd } = this.config;
-        if (quietHoursStart <= quietHoursEnd) {
-            // Non-wrapping case, e.g., 8-22 (quiet from 8 AM to 10 PM)
+        if (quietHoursStart <= quietHoursEnd)
             return hour >= quietHoursStart && hour < quietHoursEnd;
-        }
-        // Wrap-around case, e.g., 23-7 (quiet from 11 PM to 7 AM)
         return hour >= quietHoursStart || hour < quietHoursEnd;
-    }
-    /**
-     * Simple text similarity (Jaccard on word set)
-     */
-    textSimilarity(a, b) {
-        const setA = new Set(a.toLowerCase().split(/\s+/));
-        const setB = new Set(b.toLowerCase().split(/\s+/));
-        let intersection = 0;
-        for (const word of setA) {
-            if (setB.has(word))
-                intersection++;
-        }
-        const union = setA.size + setB.size - intersection;
-        return union === 0 ? 0 : intersection / union;
     }
 }

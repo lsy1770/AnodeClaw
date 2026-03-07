@@ -1,6 +1,4 @@
 /**
- * Hybrid Memory System - Types
- *
- * Types for JSONL storage and memory files
+ * Memory System Types
  */
 export {};

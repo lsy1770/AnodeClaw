@@ -98,10 +98,15 @@ export const SocialPlatformConfigSchema = z.object({
 export const ProactiveConfigSchema = z.object({
     enabled: z.boolean().default(true),
     checkInterval: z.number().int().positive().default(900000), // 15 min
+    fastCheckInterval: z.number().int().positive().default(180000), // 3 min
     quietHoursStart: z.number().int().min(0).max(23).default(23),
     quietHoursEnd: z.number().int().min(0).max(23).default(7),
     repeatThreshold: z.number().int().positive().default(5),
     idleSessionTimeout: z.number().int().positive().default(7200000), // 2h
+    minAIInterval: z.number().int().positive().default(300000), // 5 min
+    batteryThreshold: z.number().int().min(0).max(100).default(20),
+    watchedPackages: z.array(z.string()).optional(),
+    maxScreenTextChars: z.number().int().positive().default(800),
 }).optional();
 /**
  * Safety and approval configuration schema

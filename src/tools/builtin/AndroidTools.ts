@@ -49,6 +49,7 @@ declare const auto: {
   multiTouch(touches: Array<{ duration: number, points: Array<{ x: number, y: number }> }>): Promise<boolean>;
 
   // Selector & Node finding - Kotlin: selector(): AccessibilitySelector
+  // Chainable: .text(s) .textContains(s) .id(s) .desc(s) .className(s) .clickable(b) .scrollable(b) .editable(b) .visible(b) .enabled(b)
   selector(): any;  // Returns AccessibilitySelector with chainable methods
   // Kotlin: findOne(selector: AccessibilitySelector)
   findOne(selector: any): Promise<any>;  // Returns AccessibilityNode or null
@@ -58,8 +59,9 @@ declare const auto: {
   findAll(selector: any): Promise<any[]>;  // Returns List<AccessibilityNode>
   // Kotlin: exists(selector: AccessibilitySelector)
   exists(selector: any): Promise<boolean>;
-  // Kotlin: waitFor(selector: AccessibilitySelector, timeout: Long = 10000)
-  waitFor(selector: any, timeout?: number): Promise<any>;
+  // Kotlin: waitFor(selector) — always 10000ms; waitForWithTimeout(selector, timeout) for custom
+  waitFor(selector: any): Promise<any>;
+  waitForWithTimeout(selector: any, timeout: number): Promise<any>;
   // Kotlin: waitForGone(selector: AccessibilitySelector) / waitForGoneWithTimeout(selector, timeout)
   waitForGone(selector: any): Promise<boolean>;
   waitForGoneWithTimeout(selector: any, timeout: number): Promise<boolean>;
@@ -345,7 +347,7 @@ export const androidFindTextTool: Tool = {
     {
       name: 'exact',
       description: 'Match exact text (default: false for partial match)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),  // �?Auto-convert strings to boolean
       required: false,
       default: false,
     },
@@ -371,6 +373,13 @@ export const androidFindTextTool: Tool = {
 
       logger.debug(`Android find text: "${text}" (exact: ${exact}, maxResults: ${maxResults})`);
 
+      // Clear window filter to ensure we can see all windows
+      try {
+        await auto.clearWindowFilter();
+      } catch (e) {
+        logger.warn('Failed to clear window filter:', e);
+      }
+
       // Override timeout if not set - give this tool more time
       const effectiveOptions = {
         ...options,
@@ -385,16 +394,25 @@ export const androidFindTextTool: Tool = {
         selector.textContains(text);
       }
 
-      // If timeout, use waitFor, otherwise use findAll
+      // ⚠️ PERFORMANCE FIX: Use findOne instead of findAll to avoid slow UI traversal
+      // findAll on complex UIs can take 30-60s. findOne stops at first match.
       let nodes: any[];
       if (timeout > 0) {
-        const node = await auto.waitFor(selector, timeout);
+        const node = await auto.waitForWithTimeout(selector, timeout);
         nodes = node ? [node] : [];
       } else {
         const startTime = Date.now();
-        logger.debug('Calling auto.findAll() - this may take 30-60s on complex UIs...');
-        nodes = await auto.findAll(selector);
-        logger.debug(`auto.findAll() completed in ${Date.now() - startTime}ms, found ${nodes.length} nodes`);
+        logger.debug('Using findOne (fast) instead of findAll to avoid 30s+ timeout...');
+
+        // Use findOne which stops at first match (much faster)
+        const firstNode = await auto.findOne(selector);
+        nodes = firstNode ? [firstNode] : [];
+
+        logger.debug(`findOne completed in ${Date.now() - startTime}ms, found: ${nodes.length > 0}`);
+
+        if (nodes.length === 0) {
+          logger.warn(`No elements found with text "${text}". Consider using android_describe_screen to see available elements.`);
+        }
       }
 
       // Limit results to avoid excessive processing
@@ -462,7 +480,7 @@ export const androidInputTextTool: Tool = {
     {
       name: 'clearFirst',
       description: 'Clear existing text before input (default: false)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -562,7 +580,10 @@ export const androidScreenshotTool: Tool = {
     {
       name: 'format',
       description: 'Image format: png or jpg (default: png)',
-      schema: z.enum(['png', 'jpg']),
+      schema: z.preprocess(
+        val => typeof val === 'string' ? val.toLowerCase() : val,
+        z.enum(['png', 'jpg'])
+      ),
       required: false,
       default: 'png',
     },
@@ -576,7 +597,7 @@ export const androidScreenshotTool: Tool = {
     {
       name: 'useAccessibility',
       description: 'Use accessibility service for screenshot (default: false, no permission needed)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -698,7 +719,7 @@ export const androidFindByIdTool: Tool = {
       // If timeout, use waitFor, otherwise use findAll
       let nodes: any[];
       if (timeout > 0) {
-        const node = await auto.waitFor(selector, timeout);
+        const node = await auto.waitForWithTimeout(selector, timeout);
         nodes = node ? [node] : [];
       } else {
         nodes = await auto.findAll(selector);
@@ -897,7 +918,10 @@ export const androidScrollTool: Tool = {
     {
       name: 'direction',
       description: 'Scroll direction: forward or backward',
-      schema: z.enum(['forward', 'backward']),
+      schema: z.preprocess(
+        val => typeof val === 'string' ? val.toLowerCase() : val,
+        z.enum(['forward', 'backward'])
+      ),
       required: false,
       default: 'forward',
     },
@@ -993,7 +1017,7 @@ export const androidWaitForTool: Tool = {
         selector.id(id);
       }
 
-      const node = await auto.waitFor(selector, timeout);
+      const node = await auto.waitForWithTimeout(selector, timeout);
 
       return {
         success: true,
@@ -1036,8 +1060,24 @@ export const androidCheckAccessibilityTool: Tool = {
   async execute(params, options): Promise<ToolResult> {
     try {
       logger.debug('Checking accessibility service');
+      logger.debug('[android_check_accessibility] Step A: Checking if auto is defined');
+      logger.debug(`[android_check_accessibility] typeof auto = ${typeof auto}`);
 
-      const isEnabled = await auto.isEnabled();
+      if (typeof auto === 'undefined') {
+        throw new Error('auto global object is undefined');
+      }
+
+      logger.debug('[android_check_accessibility] Step B: Checking if auto.isEnabled is a function');
+      logger.debug(`[android_check_accessibility] typeof auto.isEnabled = ${typeof auto.isEnabled}`);
+
+      logger.debug('[android_check_accessibility] Step C: Calling auto.isEnabled()');
+      const isEnabledPromise = auto.isEnabled();
+      logger.debug(`[android_check_accessibility] Step D: Got promise, typeof = ${typeof isEnabledPromise}`);
+      logger.debug(`[android_check_accessibility] Step E: Awaiting promise`);
+
+      const isEnabled = await isEnabledPromise;
+
+      logger.debug(`[android_check_accessibility] Step F: Promise resolved, result = ${isEnabled}`);
 
       return {
         success: true,
@@ -1456,7 +1496,7 @@ export const androidExistsTool: Tool = {
     {
       name: 'exact',
       description: 'Match exact text (default: false)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -1498,7 +1538,7 @@ export const androidExistsTool: Tool = {
  */
 export const androidFindOneTool: Tool = {
   name: 'android_find_one',
-  description: 'Find a single UI element matching the given criteria. Returns the first match or null.',
+  description: 'Find a single UI element matching the given criteria. Returns the first match with full properties (bounds, clickable, desc, etc.).',
   category: 'android',
   permissions: ['android:read'],
   parallelizable: true,
@@ -1506,26 +1546,32 @@ export const androidFindOneTool: Tool = {
   parameters: [
     {
       name: 'text',
-      description: 'Text to search for (optional)',
+      description: 'Text content to search for (partial match by default)',
       schema: z.string(),
       required: false,
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn_send" (most reliable selector)',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription — used by icon buttons with no visible text, e.g. "发送" "语音" "更多"',
       schema: z.string(),
       required: false,
     },
     {
       name: 'className',
-      description: 'Class name to match (optional, e.g. "android.widget.Button")',
+      description: 'Class name, e.g. "android.widget.Button", "android.widget.EditText"',
       schema: z.string(),
       required: false,
     },
     {
       name: 'exact',
-      description: 'Match exact text (default: false)',
-      schema: z.boolean(),
+      description: 'Match exact text (default: false, partial match)',
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -1533,16 +1579,17 @@ export const androidFindOneTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, exact = false } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, exact = false } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
-      logger.debug(`Android findOne: text="${text}" id="${id}" className="${className}"`);
+      logger.debug(`Android findOne: text="${text ?? '-'}" id="${id ?? '-'}" desc="${desc ?? '-'}" className="${className ?? '-'}"`);
       const selector = auto.selector();
       if (text) {
         if (exact) { selector.text(text); } else { selector.textContains(text); }
       }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
       const node = await auto.findOne(selector);
       return {
@@ -1552,10 +1599,12 @@ export const androidFindOneTool: Tool = {
           node: node ? {
             text: node.text,
             id: node.id,
+            desc: node.contentDescription,
             bounds: node.bounds,
-            clickable: node.clickable,
+            clickable: node.isClickable,
+            scrollable: node.isScrollable,
+            editable: node.isEditable,
             className: node.className,
-            description: node.contentDescription,
           } : null,
         },
       };
@@ -1781,16 +1830,16 @@ export const androidGetLayoutTool: Tool = {
     {
       name: 'visibleOnly',
       description: 'Only include visible elements (default: true)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: true,
     },
     {
       name: 'interactiveOnly',
-      description: 'Only include interactive elements (clickable/scrollable/editable) (default: false)',
-      schema: z.boolean(),
+      description: 'Only include interactive elements (clickable/scrollable/editable). RECOMMENDED: true to avoid 30s+ timeout (default: true)',
+      schema: z.coerce.boolean(),
       required: false,
-      default: false,
+      default: true,  // �?Changed from false to true for performance
     },
     {
       name: 'maxDepth',
@@ -1802,7 +1851,10 @@ export const androidGetLayoutTool: Tool = {
     {
       name: 'format',
       description: 'Output format: tree (hierarchical) or flat (list) (default: tree)',
-      schema: z.enum(['tree', 'flat']),
+      schema: z.preprocess(
+        val => typeof val === 'string' ? val.toLowerCase() : val,
+        z.enum(['tree', 'flat'])
+      ),
       required: false,
       default: 'tree',
     },
@@ -1819,8 +1871,65 @@ export const androidGetLayoutTool: Tool = {
 
       logger.debug(`Getting layout tree (visibleOnly: ${visibleOnly}, interactiveOnly: ${interactiveOnly})`);
 
-      // Get all nodes using an empty selector (matches everything)
-      const selector = auto.selector();
+      // Clear window filter to ensure we can see all windows
+      try {
+        await auto.clearWindowFilter();
+      } catch (e) {
+        logger.warn('Failed to clear window filter:', e);
+      }
+
+      // �?优化：使用限制性selector减少节点数量
+      let selector = auto.selector();
+
+      // 如果只需要可见元素，在selector层面过滤（但ACS可能不支持visible selector�?
+      // 如果只需要交互元素，使用clickable/scrollable/editable selector
+      if (interactiveOnly) {
+        // 获取所有可交互的节点（clickable OR scrollable OR editable�?
+        const clickableNodes = await auto.findAll(auto.selector().clickable(true));
+        const scrollableNodes = await auto.findAll(auto.selector().scrollable(true));
+        const editableNodes = await auto.findAll(auto.selector().editable(true));
+
+        // 合并去重
+        const nodeMap = new Map();
+        [...clickableNodes, ...scrollableNodes, ...editableNodes].forEach(node => {
+          const key = `${node.bounds?.left}-${node.bounds?.top}-${node.className}`;
+          if (!nodeMap.has(key)) {
+            nodeMap.set(key, node);
+          }
+        });
+
+        const allNodes = Array.from(nodeMap.values());
+
+        // 过滤visibleOnly
+        const filteredNodes = visibleOnly
+          ? allNodes.filter(node => node.visible)
+          : allNodes;
+
+        return {
+          success: true,
+          output: {
+            format: 'flat',
+            elements: filteredNodes.map(node => ({
+              text: node.text,
+              id: node.id,
+              className: node.className,
+              contentDescription: node.contentDescription,
+              bounds: node.bounds,
+              clickable: node.clickable,
+              scrollable: node.scrollable,
+              editable: node.editable,
+            })),
+            count: filteredNodes.length,
+            message: `Found ${filteredNodes.length} interactive elements`,
+          },
+        };
+      }
+
+      // �?原来的方法：findAll(空selector)会返回整个树的所有节点，非常慢！
+      // 如果需要完整树，我们必须接受性能开销
+      // 但至少可以限制数�?
+      logger.warn('Getting full layout tree - this may be slow on complex UIs');
+
       const allNodes = await auto.findAll(selector);
 
       if (!allNodes || allNodes.length === 0) {
@@ -1834,47 +1943,45 @@ export const androidGetLayoutTool: Tool = {
         };
       }
 
-      // Build tree from first node (usually the root)
-      const rootNode = allNodes[0];
-      const tree = traverseNode(rootNode, {
-        visibleOnly,
-        interactiveOnly,
-        maxDepth,
-        includeChildren: true,
+      logger.debug(`findAll returned ${allNodes.length} nodes`);
+
+      // 如果返回节点太多，限制处理数�?
+      const MAX_NODES = 200;
+      if (allNodes.length > MAX_NODES) {
+        logger.warn(`Too many nodes (${allNodes.length}), limiting to ${MAX_NODES} for performance`);
+      }
+
+      const limitedNodes = allNodes.slice(0, MAX_NODES);
+
+      // 过滤节点
+      const filteredNodes = limitedNodes.filter(node => {
+        if (visibleOnly && !node.visible) return false;
+        if (interactiveOnly && !node.clickable && !node.scrollable && !node.editable) return false;
+        return true;
       });
 
-      if (!tree) {
-        return {
-          success: true,
-          output: {
-            message: 'No matching elements found after filtering',
-            tree: null,
-            count: 0,
-          },
-        };
-      }
-
-      // Convert to flat list if requested
-      let output: any;
-      if (format === 'flat') {
-        const flatList = flattenNodeTree(tree);
-        output = {
-          format: 'flat',
-          elements: flatList,
-          count: flatList.length,
-        };
-      } else {
-        const flatList = flattenNodeTree(tree);
-        output = {
-          format: 'tree',
-          tree,
-          count: flatList.length,
-        };
-      }
+      // 构建简化的flat输出（不要用traverseNode，避免重复遍历）
+      const elements = filteredNodes.map(node => ({
+        text: node.text,
+        id: node.id,
+        className: node.className,
+        contentDescription: node.contentDescription,
+        bounds: node.bounds,
+        clickable: node.clickable,
+        scrollable: node.scrollable,
+        editable: node.editable,
+        visible: node.visible,
+      }));
 
       return {
         success: true,
-        output,
+        output: {
+          format: 'flat',  // 强制使用flat，tree格式需要children信息
+          elements,
+          count: elements.length,
+          totalNodesScanned: allNodes.length,
+          truncated: allNodes.length > MAX_NODES,
+        },
       };
     } catch (error) {
       return {
@@ -1904,14 +2011,14 @@ export const androidFindInteractiveElementsTool: Tool = {
     {
       name: 'visibleOnly',
       description: 'Only include visible elements (default: true)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: true,
     },
     {
       name: 'includeText',
       description: 'Include elements with text only (default: false)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -1923,60 +2030,68 @@ export const androidFindInteractiveElementsTool: Tool = {
 
       logger.debug('Finding interactive elements');
 
-      // Get all nodes
-      const selector = auto.selector();
-      const allNodes = await auto.findAll(selector);
-
-      if (!allNodes || allNodes.length === 0) {
-        return {
-          success: true,
-          output: {
-            elements: [],
-            count: 0,
-            message: 'No elements found on screen',
-          },
-        };
+      // Clear window filter to ensure we can see all windows
+      try {
+        await auto.clearWindowFilter();
+        logger.debug('Window filter cleared');
+      } catch (e) {
+        logger.warn('Failed to clear window filter:', e);
       }
 
-      // Traverse and filter
-      const rootNode = allNodes[0];
-      const tree = traverseNode(rootNode, {
-        visibleOnly,
-        interactiveOnly: !includeText,
-        maxDepth: 50,
-        includeChildren: true,
-      });
+      // �?优化：直接使用selector过滤，避免获取所有节�?
+      logger.debug('Using optimized selector-based search...');
 
-      if (!tree) {
-        return {
-          success: true,
-          output: {
-            elements: [],
-            count: 0,
-            message: 'No interactive elements found',
-          },
-        };
+      // 分别查找clickable, scrollable, editable元素
+      const [clickableNodes, scrollableNodes, editableNodes] = await Promise.all([
+        auto.findAll(auto.selector().clickable(true)),
+        auto.findAll(auto.selector().scrollable(true)),
+        auto.findAll(auto.selector().editable(true)),
+      ]);
+
+      logger.debug(`Found: ${clickableNodes.length} clickable, ${scrollableNodes.length} scrollable, ${editableNodes.length} editable`);
+
+      // 合并并去重（基于bounds位置�?
+      const nodeMap = new Map<string, any>();
+
+      const addNode = (node: any, type: string) => {
+        if (!node) return;
+
+        // 基于位置和className的唯一key
+        const key = `${node.bounds?.left}-${node.bounds?.top}-${node.bounds?.right}-${node.bounds?.bottom}-${node.className}`;
+
+        if (!nodeMap.has(key)) {
+          nodeMap.set(key, {
+            text: node.text,
+            id: node.id,
+            className: node.className,
+            contentDescription: node.contentDescription,
+            bounds: node.bounds,
+            clickable: node.clickable,
+            scrollable: node.scrollable,
+            editable: node.editable,
+            visible: node.visible,
+            type,  // 主要交互类型
+          });
+        }
+      };
+
+      clickableNodes.forEach(node => addNode(node, 'clickable'));
+      scrollableNodes.forEach(node => addNode(node, 'scrollable'));
+      editableNodes.forEach(node => addNode(node, 'editable'));
+
+      let elements = Array.from(nodeMap.values());
+
+      // 过滤visibleOnly
+      if (visibleOnly) {
+        elements = elements.filter(e => e.visible);
       }
 
-      // Flatten and simplify
-      const flatList = flattenNodeTree(tree);
-      const elements = flatList.map((node, index) => ({
-        index,
-        text: node.text,
-        id: node.id,
-        className: node.className,
-        contentDescription: node.contentDescription,
-        bounds: node.bounds,
-        isClickable: node.isClickable,
-        isScrollable: node.isScrollable,
-        isEditable: node.isEditable,
-        depth: node.depth,
-      }));
+      // 按类型分组统�?
+      const clickable = elements.filter(e => e.clickable);
+      const scrollable = elements.filter(e => e.scrollable);
+      const editable = elements.filter(e => e.editable);
 
-      // Group by type for easier navigation
-      const clickable = elements.filter(e => e.isClickable);
-      const scrollable = elements.filter(e => e.isScrollable);
-      const editable = elements.filter(e => e.isEditable);
+      logger.debug(`After filtering: ${elements.length} total interactive elements`);
 
       return {
         success: true,
@@ -1989,8 +2104,8 @@ export const androidFindInteractiveElementsTool: Tool = {
             scrollableCount: scrollable.length,
             editableCount: editable.length,
           },
-          groupedByType: {
-            clickable: clickable.slice(0, 20), // Limit to first 20
+          grouped: {
+            clickable: clickable.slice(0, 20),  // 限制数量避免输出过大
             scrollable: scrollable.slice(0, 10),
             editable: editable.slice(0, 10),
           },
@@ -2026,6 +2141,13 @@ export const androidDescribeScreenTool: Tool = {
     try {
       logger.debug('Describing current screen');
 
+      // Clear window filter to ensure we can see all windows
+      try {
+        await auto.clearWindowFilter();
+      } catch (e) {
+        logger.warn('Failed to clear window filter:', e);
+      }
+
       // Get app context
       const [packageName, activity, windows] = await Promise.all([
         auto.getCurrentPackage(),
@@ -2033,47 +2155,51 @@ export const androidDescribeScreenTool: Tool = {
         auto.getWindows(),
       ]);
 
-      // Get interactive elements
-      const selector = auto.selector();
-      const allNodes = await auto.findAll(selector);
+      // �?优化：使用限制性selector直接查找交互元素和文本元�?
+      logger.debug('Getting interactive and text elements with optimized selectors...');
 
-      let interactiveElements: any[] = [];
-      let textElements: any[] = [];
+      const [clickableNodes, scrollableNodes, editableNodes] = await Promise.all([
+        auto.findAll(auto.selector().clickable(true)),
+        auto.findAll(auto.selector().scrollable(true)),
+        auto.findAll(auto.selector().editable(true)),
+      ]);
 
-      if (allNodes && allNodes.length > 0) {
-        const rootNode = allNodes[0];
-        const tree = traverseNode(rootNode, {
-          visibleOnly: true,
-          interactiveOnly: false,
-          maxDepth: 50,
-          includeChildren: true,
-        });
+      // 合并去重interactive elements
+      const interactiveMap = new Map<string, any>();
 
-        if (tree) {
-          const flatList = flattenNodeTree(tree);
-
-          interactiveElements = flatList
-            .filter(n => n.isClickable || n.isScrollable || n.isEditable)
-            .map(n => ({
-              text: n.text,
-              id: n.id,
-              className: n.className,
-              description: n.contentDescription,
-              isClickable: n.isClickable,
-              isScrollable: n.isScrollable,
-              isEditable: n.isEditable,
-            }))
-            .slice(0, 30); // Limit to top 30
-
-          textElements = flatList
-            .filter(n => n.text && n.text.length > 0)
-            .map(n => ({
-              text: n.text,
-              className: n.className,
-            }))
-            .slice(0, 20); // Limit to top 20
+      const addInteractive = (node: any) => {
+        if (!node || !node.visible) return;  // 只要可见元素
+        const key = `${node.bounds?.left}-${node.bounds?.top}-${node.className}`;
+        if (!interactiveMap.has(key)) {
+          interactiveMap.set(key, {
+            text: node.text,
+            id: node.id,
+            className: node.className,
+            description: node.contentDescription,
+            clickable: node.clickable,
+            scrollable: node.scrollable,
+            editable: node.editable,
+          });
         }
-      }
+      };
+
+      clickableNodes.forEach(addInteractive);
+      scrollableNodes.forEach(addInteractive);
+      editableNodes.forEach(addInteractive);
+
+      const interactiveElements = Array.from(interactiveMap.values()).slice(0, 30);
+
+      // 获取文本元素 - 使用textContains查找有文本的元素
+      // 注意：可能没有直接的"有文�?selector，所以用clickable元素中的文本
+      const textElements = interactiveElements
+        .filter(e => e.text && e.text.length > 0)
+        .map(e => ({
+          text: e.text,
+          className: e.className,
+        }))
+        .slice(0, 20);
+
+      logger.debug(`Found ${interactiveElements.length} interactive elements, ${textElements.length} text elements`);
 
       return {
         success: true,
@@ -2116,7 +2242,13 @@ export const androidDescribeScreenTool: Tool = {
  */
 export const androidClickElementTool: Tool = {
   name: 'android_click_element',
-  description: 'Find a UI element and click it using the element\'s native click method. More reliable than coordinate-based clicking.',
+  description: `Find a UI element and click it. Selector priority guide:
+- id: Most reliable. Use full resource ID e.g. "com.tencent.mm:id/btn_send"
+- desc: For icon buttons with no visible text — contentDescription e.g. "发送" "语音" "更多"
+- text: For buttons/labels with visible text
+- className: For generic containers e.g. "android.widget.Button"
+
+If the found element is NOT clickable (e.g. a text label inside a button), automatically falls back to coordinate-based click so the touch event propagates to the clickable parent.`,
   category: 'android',
   permissions: ['android:interact'],
   parallelizable: false,
@@ -2124,26 +2256,32 @@ export const androidClickElementTool: Tool = {
   parameters: [
     {
       name: 'text',
-      description: 'Text to search for (optional)',
+      description: 'Visible text to match (partial by default)',
       schema: z.string(),
       required: false,
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn_send"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text, e.g. "语音" "发送图片"',
       schema: z.string(),
       required: false,
     },
     {
       name: 'className',
-      description: 'Class name (optional)',
+      description: 'Class name, e.g. "android.widget.Button"',
       schema: z.string(),
       required: false,
     },
     {
       name: 'exact',
       description: 'Match exact text (default: false)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -2158,50 +2296,61 @@ export const androidClickElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, exact = false, timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, exact = false, timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
-      logger.debug(`Android click element: text="${text}" id="${id}" className="${className}"`);
+      logger.debug(`Android click element: text="${text ?? '-'}" id="${id ?? '-'}" desc="${desc ?? '-'}" className="${className ?? '-'}"`);
 
-      // Create selector
+      // Build selector
       const selector = auto.selector();
       if (text) {
         if (exact) { selector.text(text); } else { selector.textContains(text); }
       }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
       // Find element with timeout
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {
           success: false,
           error: {
             code: 'ELEMENT_NOT_FOUND',
-            message: `Element not found: text="${text}" id="${id}" className="${className}"`,
+            message: `Element not found: text="${text ?? '-'}" id="${id ?? '-'}" desc="${desc ?? '-'}" className="${className ?? '-'}"`,
           },
         };
       }
 
-      // Check if clickable
-      const isClickable = node.clickable ?? false;
-      if (!isClickable) {
-        logger.warn(`Element is not clickable, attempting click anyway`);
-      }
+      const isClickable = node.isClickable ?? false;
 
-      // Click using node's method
-      const clicked = await node.click();
+      // Try native accessibility click first
+      let clicked = await node.click();
+
+      // If not clickable or click failed, fall back to coordinate click
+      // Touch events propagate up the view hierarchy to the clickable parent
+      if (!clicked) {
+        const bounds = node.bounds;
+        if (bounds) {
+          const cx = Math.round((bounds.left + bounds.right) / 2);
+          const cy = Math.round((bounds.top + bounds.bottom) / 2);
+          logger.debug(`Accessibility click failed (clickable=${isClickable}), falling back to coordinate click at (${cx}, ${cy})`);
+          clicked = await auto.click(cx, cy);
+        }
+      }
 
       return {
         success: clicked,
         output: {
           action: 'click_element',
           clicked,
+          usedCoordinateFallback: !isClickable,
           element: {
             text: node.text,
             id: node.id,
+            desc: node.contentDescription,
             className: node.className,
             clickable: isClickable,
           },
@@ -2240,7 +2389,13 @@ export const androidLongClickElementTool: Tool = {
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text',
       schema: z.string(),
       required: false,
     },
@@ -2253,7 +2408,7 @@ export const androidLongClickElementTool: Tool = {
     {
       name: 'exact',
       description: 'Match exact text (default: false)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: false,
     },
@@ -2268,20 +2423,21 @@ export const androidLongClickElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, exact = false, timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, exact = false, timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
-      logger.debug(`Android long click element: text="${text}" id="${id}" className="${className}"`);
+      logger.debug(`Android long click element: text="${text ?? '-'}" id="${id ?? '-'}" desc="${desc ?? '-'}" className="${className ?? '-'}"`);
 
       const selector = auto.selector();
       if (text) {
         if (exact) { selector.text(text); } else { selector.textContains(text); }
       }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {
@@ -2337,7 +2493,13 @@ export const androidInputTextToElementTool: Tool = {
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text',
       schema: z.string(),
       required: false,
     },
@@ -2356,7 +2518,7 @@ export const androidInputTextToElementTool: Tool = {
     {
       name: 'clearFirst',
       description: 'Clear existing text before input (default: true)',
-      schema: z.boolean(),
+      schema: z.coerce.boolean(),
       required: false,
       default: true,
     },
@@ -2371,18 +2533,19 @@ export const androidInputTextToElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, inputText, clearFirst = true, timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, inputText, clearFirst = true, timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
       logger.debug(`Android input text to element: "${inputText}"`);
 
       const selector = auto.selector();
       if (text) { selector.textContains(text); }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {
@@ -2452,7 +2615,13 @@ export const androidScrollElementTool: Tool = {
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text',
       schema: z.string(),
       required: false,
     },
@@ -2465,7 +2634,10 @@ export const androidScrollElementTool: Tool = {
     {
       name: 'direction',
       description: 'Scroll direction: forward or backward',
-      schema: z.enum(['forward', 'backward']),
+      schema: z.preprocess(
+        val => typeof val === 'string' ? val.toLowerCase() : val,
+        z.enum(['forward', 'backward'])
+      ),
       required: false,
       default: 'forward',
     },
@@ -2480,18 +2652,19 @@ export const androidScrollElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, direction = 'forward', timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, direction = 'forward', timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
       logger.debug(`Android scroll element ${direction}`);
 
       const selector = auto.selector();
       if (text) { selector.textContains(text); }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {
@@ -2554,7 +2727,13 @@ export const androidExpandElementTool: Tool = {
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text',
       schema: z.string(),
       required: false,
     },
@@ -2575,18 +2754,19 @@ export const androidExpandElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
       logger.debug(`Android expand element`);
 
       const selector = auto.selector();
       if (text) { selector.textContains(text); }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {
@@ -2640,7 +2820,13 @@ export const androidCollapseElementTool: Tool = {
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text',
       schema: z.string(),
       required: false,
     },
@@ -2661,18 +2847,19 @@ export const androidCollapseElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
       logger.debug(`Android collapse element`);
 
       const selector = auto.selector();
       if (text) { selector.textContains(text); }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {
@@ -2726,7 +2913,13 @@ export const androidFocusElementTool: Tool = {
     },
     {
       name: 'id',
-      description: 'Resource ID (optional)',
+      description: 'Resource ID, e.g. "com.example:id/btn"',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'desc',
+      description: 'contentDescription for icon buttons without text',
       schema: z.string(),
       required: false,
     },
@@ -2747,18 +2940,19 @@ export const androidFocusElementTool: Tool = {
 
   async execute(params, options): Promise<ToolResult> {
     try {
-      const { text, id, className, timeout = 5000 } = params;
-      if (!text && !id && !className) {
-        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, or className must be provided' } };
+      const { text, id, desc, className, timeout = 5000 } = params;
+      if (!text && !id && !desc && !className) {
+        return { success: false, error: { code: 'INVALID_PARAMS', message: 'At least one of text, id, desc, or className must be provided' } };
       }
       logger.debug(`Android focus element`);
 
       const selector = auto.selector();
       if (text) { selector.textContains(text); }
       if (id) { selector.id(id); }
+      if (desc) { selector.desc(desc); }
       if (className) { selector.className(className); }
 
-      const node = timeout > 0 ? await auto.waitFor(selector, timeout) : await auto.findOne(selector);
+      const node = timeout > 0 ? await auto.waitForWithTimeout(selector, timeout) : await auto.findOne(selector);
 
       if (!node) {
         return {

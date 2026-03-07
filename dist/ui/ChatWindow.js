@@ -1,116 +1,124 @@
 /**
- * Chat Window - Main conversation interface
+ * Chat Window - Agent Process Monitor
  *
- * Floating window-based chat interface with embedded session list and settings panels.
- * All panels share a single floatingWindow instance to avoid conflicts.
+ * Floating window that shows the agent's real-time thinking and task execution process.
+ * - Process log: real-time tool events (tool:before / tool:after / tool:error)
+ * - AI output: character-by-character streaming via sendMessageWithStreaming
+ * - Status bar: current phase + iteration counter
  */
-import { createMessageBubble, createThinkingIndicator, generateViewId, escapeXml, formatTimestamp } from './utils.js';
+import { EventBus } from '../core/EventBus.js';
+import { generateViewId, escapeXml } from './utils.js';
 import { logger } from '../utils/logger.js';
 /**
- * Chat Window Class
+ * Chat Window - Agent Process Monitor
  *
- * Main UI component for AI conversation with embedded session list and settings panels.
- * Uses a single floatingWindow instance — panels are toggled via visibility.
+ * Main UI showing agent's real-time thinking process and streaming output.
  */
 export class ChatWindow {
     constructor(agentManager, config) {
         this.currentSessionId = null;
         this.isVisible = false;
-        this.messageViewIds = [];
-        this.sessionItemViewIds = [];
-        this.activePanel = 'chat';
+        this.activePanel = 'monitor';
+        // Process state
+        this.isProcessing = false;
+        this.iterationCount = 0;
+        this.logViewIds = [];
+        this.streamingAccum = '';
+        this.streamingLastUpdate = 0;
+        this.STREAM_THROTTLE_MS = 120;
         this.agentManager = agentManager;
         this.config = config;
+        this.toolBeforeHandler = (data) => this.onToolBefore(data);
+        this.toolAfterHandler = (data) => this.onToolAfter(data);
+        this.toolErrorHandler = (data) => this.onToolError(data);
+        this.messageAssistantHandler = (data) => this.onMessageAssistant(data);
     }
-    /**
-     * Show the chat window
-     */
+    // ==================================================
+    // Lifecycle
+    // ==================================================
     async show(config = {}) {
         if (this.isVisible) {
-            logger.debug('Chat window already visible');
             floatingWindow.show();
             return;
         }
-        const xml = this.createMainLayout();
-        floatingWindow.create(xml);
+        floatingWindow.create(this.createMainLayout());
         floatingWindow.setSize(config.width ?? 700, config.height ?? 1000);
         floatingWindow.setPosition(config.x ?? 50, config.y ?? 100);
         floatingWindow.setTouchable(true);
         this.setupEventListeners();
+        this.subscribeToEventBus();
         floatingWindow.show();
         this.isVisible = true;
         await this.initializeSession();
-        logger.info('Chat window shown');
+        this.setStatus('空闲', false);
+        logger.info('[ChatWindow] Agent process monitor shown');
     }
-    /**
-     * Hide the chat window (keeps state)
-     */
     hide() {
         if (!this.isVisible)
             return;
         floatingWindow.hide();
         this.isVisible = false;
-        logger.info('Chat window hidden');
+        logger.info('[ChatWindow] Hidden');
     }
-    /**
-     * Close the chat window (destroys state)
-     */
     close() {
         if (!this.isVisible)
             return;
+        this.unsubscribeFromEventBus();
         floatingWindow.close();
         this.isVisible = false;
-        logger.info('Chat window closed');
+        logger.info('[ChatWindow] Closed');
     }
-    /**
-     * Set callback for when config is saved from settings panel
-     */
     onConfigSave(callback) {
         this.onConfigSaveCallback = callback;
     }
-    /**
-     * Get current session ID
-     */
     getCurrentSessionId() {
         return this.currentSessionId;
     }
-    /**
-     * Switch to a different session
-     */
-    async switchSession(sessionId) {
-        this.currentSessionId = sessionId;
-        this.clearMessages();
-        await this.loadSessionHistory();
-        this.showPanel('chat');
-        logger.info(`Switched to session: ${sessionId}`);
+    // ==================================================
+    // EventBus
+    // ==================================================
+    subscribeToEventBus() {
+        const bus = EventBus.getInstance();
+        bus.on('tool:before', this.toolBeforeHandler);
+        bus.on('tool:after', this.toolAfterHandler);
+        bus.on('tool:error', this.toolErrorHandler);
+        bus.on('message:assistant', this.messageAssistantHandler);
     }
-    // ==================================================
-    // Panel switching — uses View.setVisibility()
-    // ==================================================
-    /**
-     * Switch to the specified panel.
-     * View.VISIBLE = 0, View.GONE = 8
-     */
-    showPanel(panel) {
-        this.activePanel = panel;
-        const panels = {
-            chat: 'chat_panel',
-            sessions: 'session_panel',
-            settings: 'settings_panel',
-        };
-        for (const [key, viewId] of Object.entries(panels)) {
-            const view = floatingWindow.findView(viewId);
-            if (view && typeof view.setVisibility === 'function') {
-                view.setVisibility(key === panel ? 0 : 8);
-            }
-        }
-        // Populate panel data when switching to it
-        if (panel === 'sessions') {
-            this.populateSessionList();
-        }
-        else if (panel === 'settings') {
-            this.populateSettings();
-        }
+    unsubscribeFromEventBus() {
+        const bus = EventBus.getInstance();
+        bus.off('tool:before', this.toolBeforeHandler);
+        bus.off('tool:after', this.toolAfterHandler);
+        bus.off('tool:error', this.toolErrorHandler);
+        bus.off('message:assistant', this.messageAssistantHandler);
+    }
+    onToolBefore(data) {
+        if (!this.isVisible)
+            return;
+        this.addLogLine(`🔧 ${data.toolName}(${this.formatArgs(data.args)})`, '#80CBC4');
+        this.setStatus(`执行: ${data.toolName}`, true);
+    }
+    onToolAfter(data) {
+        if (!this.isVisible)
+            return;
+        this.addLogLine(`   ✓ 成功 (${data.duration}ms)`, '#81C784');
+        if (this.isProcessing)
+            this.setStatus('思考中...', true);
+    }
+    onToolError(data) {
+        if (!this.isVisible)
+            return;
+        const errStr = String(data.error?.message || data.error).substring(0, 80);
+        this.addLogLine(`   ✗ 失败: ${errStr}`, '#EF9A9A');
+        if (this.isProcessing)
+            this.setStatus('思考中...', true);
+    }
+    onMessageAssistant(_data) {
+        if (!this.isVisible || !this.isProcessing)
+            return;
+        // Each assistant message marks the end of one reasoning iteration
+        this.iterationCount++;
+        this.updateIterationView();
+        this.addLogLine(`── 第 ${this.iterationCount} 轮 ──`, '#555555');
     }
     // ==================================================
     // Layout
@@ -120,22 +128,22 @@ export class ChatWindow {
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- ===== Chat Panel (default visible) ===== -->
+    <!-- ===== Monitor Panel ===== -->
     <LinearLayout
-        android:id="@+id/chat_panel"
+        android:id="@+id/monitor_panel"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:background="#CC1E1E1E"
+        android:background="#CC1A1A1A"
         android:visibility="visible">
 
-        <!-- Chat Toolbar -->
+        <!-- Toolbar -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="44dp"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:background="#DD2A2A2A"
+            android:background="#DD242424"
             android:paddingStart="12dp"
             android:paddingEnd="8dp">
 
@@ -150,10 +158,10 @@ export class ChatWindow {
                 android:textStyle="bold"/>
 
             <Button
-                android:id="@+id/btn_sessions"
+                android:id="@+id/btn_new_session"
                 android:layout_width="36dp"
                 android:layout_height="36dp"
-                android:text="📋"
+                android:text="🔄"
                 android:textSize="16sp"
                 android:textColor="#EAEAEA"
                 android:background="#00000000"
@@ -188,21 +196,102 @@ export class ChatWindow {
                 android:padding="0dp"/>
         </LinearLayout>
 
-        <!-- Message ScrollView -->
+        <!-- Status Bar -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="28dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#DD1E1E1E"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp">
+
+            <TextView
+                android:id="@+id/status_dot"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="○"
+                android:textSize="12sp"
+                android:textColor="#888888"/>
+
+            <TextView
+                android:id="@+id/status_text"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text=" 空闲"
+                android:textSize="12sp"
+                android:textColor="#888888"
+                android:layout_marginStart="4dp"/>
+
+            <TextView
+                android:id="@+id/iteration_text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textSize="11sp"
+                android:textColor="#555555"/>
+        </LinearLayout>
+
+        <!-- Process Log Header -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="22dp"
+            android:text="  进程日志"
+            android:textSize="11sp"
+            android:textColor="#555555"
+            android:gravity="center_vertical"
+            android:background="#DD191919"/>
+
+        <!-- Process Log -->
         <ScrollView
-            android:id="@+id/scroll_messages"
+            android:id="@+id/scroll_log"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1"
-            android:padding="12dp"
-            android:background="#00000000"
+            android:layout_weight="35"
+            android:background="#CC111111"
             android:scrollbars="vertical">
 
             <LinearLayout
-                android:id="@+id/messages_container"
+                android:id="@+id/log_container"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="vertical"/>
+                android:orientation="vertical"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"/>
+        </ScrollView>
+
+        <!-- AI Output Header -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="22dp"
+            android:text="  AI 输出"
+            android:textSize="11sp"
+            android:textColor="#555555"
+            android:gravity="center_vertical"
+            android:background="#DD191919"/>
+
+        <!-- AI Output (streaming) -->
+        <ScrollView
+            android:id="@+id/scroll_output"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="40"
+            android:background="#CC0F0F0F"
+            android:scrollbars="vertical"
+            android:padding="10dp">
+
+            <TextView
+                android:id="@+id/output_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textSize="13sp"
+                android:textColor="#DDDDDD"
+                android:fontFamily="monospace"
+                android:lineSpacingMultiplier="1.35"/>
         </ScrollView>
 
         <!-- Input Area -->
@@ -211,7 +300,7 @@ export class ChatWindow {
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:padding="8dp"
-            android:background="#CC303030"
+            android:background="#CC2A2A2A"
             android:gravity="center_vertical">
 
             <EditText
@@ -219,13 +308,13 @@ export class ChatWindow {
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="输入消息..."
+                android:hint="输入任务..."
                 android:textColor="#EAEAEA"
-                android:textColorHint="#888888"
-                android:padding="12dp"
-                android:maxLines="4"
+                android:textColorHint="#666666"
+                android:padding="10dp"
+                android:maxLines="3"
                 android:inputType="textMultiLine"
-                android:background="#CC3E3E3E"/>
+                android:background="#CC363636"/>
 
             <Button
                 android:id="@+id/btn_send"
@@ -238,104 +327,7 @@ export class ChatWindow {
         </LinearLayout>
     </LinearLayout>
 
-    <!-- ===== Session List Panel (hidden) ===== -->
-    <LinearLayout
-        android:id="@+id/session_panel"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:orientation="vertical"
-        android:background="#CC1E1E1E"
-        android:visibility="gone">
-
-        <!-- Session Toolbar -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="44dp"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="#DD2A2A2A"
-            android:paddingStart="12dp"
-            android:paddingEnd="8dp">
-
-            <Button
-                android:id="@+id/btn_back_sessions"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
-                android:text="←"
-                android:textSize="18sp"
-                android:textColor="#EAEAEA"
-                android:background="#00000000"
-                android:minWidth="0dp"
-                android:minHeight="0dp"
-                android:padding="0dp"/>
-
-            <TextView
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="会话列表"
-                android:textSize="14sp"
-                android:textColor="#80CBC4"
-                android:textStyle="bold"
-                android:layout_marginStart="8dp"/>
-
-            <Button
-                android:id="@+id/btn_new_session"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
-                android:text="＋"
-                android:textSize="18sp"
-                android:textColor="#EAEAEA"
-                android:background="#00000000"
-                android:minWidth="0dp"
-                android:minHeight="0dp"
-                android:padding="0dp"/>
-        </LinearLayout>
-
-        <!-- Session List -->
-        <ScrollView
-            android:id="@+id/scroll_sessions"
-            android:layout_width="match_parent"
-            android:layout_height="0dp"
-            android:layout_weight="1"
-            android:scrollbars="vertical">
-
-            <LinearLayout
-                android:id="@+id/session_list_container"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"/>
-        </ScrollView>
-
-        <!-- Empty state -->
-        <LinearLayout
-            android:id="@+id/session_empty_state"
-            android:layout_width="match_parent"
-            android:layout_height="0dp"
-            android:layout_weight="1"
-            android:orientation="vertical"
-            android:gravity="center"
-            android:visibility="gone">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="暂无会话"
-                android:textSize="16sp"
-                android:textColor="#AAAAAA"/>
-
-            <Button
-                android:id="@+id/btn_create_first"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="创建新会话"
-                android:textColor="#80CBC4"
-                android:background="#00000000"
-                android:layout_marginTop="16dp"/>
-        </LinearLayout>
-    </LinearLayout>
-
-    <!-- ===== Settings Panel (hidden) ===== -->
+    <!-- ===== Settings Panel ===== -->
     <LinearLayout
         android:id="@+id/settings_panel"
         android:layout_width="match_parent"
@@ -400,7 +392,6 @@ export class ChatWindow {
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
 
-                <!-- Model Settings -->
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
@@ -485,7 +476,6 @@ export class ChatWindow {
                     android:padding="12dp"
                     android:layout_marginTop="4dp"/>
 
-                <!-- Divider -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="1dp"
@@ -493,7 +483,6 @@ export class ChatWindow {
                     android:layout_marginTop="24dp"
                     android:layout_marginBottom="16dp"/>
 
-                <!-- About -->
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
@@ -528,373 +517,246 @@ export class ChatWindow {
     // Event listeners
     // ==================================================
     setupEventListeners() {
-        logger.debug('[ChatWindow] Setting up event listeners');
-        // --- Chat panel ---
-        floatingWindow.on('btn_send', 'click', () => {
-            logger.debug('[ChatWindow] btn_send clicked');
-            this.handleSendMessage();
-        });
-        floatingWindow.on('btn_close', 'click', () => {
-            logger.debug('[ChatWindow] btn_close clicked');
-            this.hide();
-        });
-        floatingWindow.on('btn_sessions', 'click', () => {
-            logger.info('[ChatWindow] btn_sessions clicked → show session panel');
-            this.showPanel('sessions');
-        });
-        floatingWindow.on('btn_settings', 'click', () => {
-            logger.info('[ChatWindow] btn_settings clicked → show settings panel');
-            this.showPanel('settings');
-        });
+        floatingWindow.on('btn_send', 'click', () => this.handleSendMessage());
+        floatingWindow.on('btn_close', 'click', () => this.hide());
+        floatingWindow.on('btn_settings', 'click', () => this.showPanel('settings'));
+        floatingWindow.on('btn_new_session', 'click', () => this.handleNewSession());
         floatingWindow.on('input_message', 'click', () => {
             floatingWindow.setFocusable(true);
             try {
-                const inputView = floatingWindow.findView('input_message');
-                if (inputView && inputView.requestFocus) {
-                    inputView.requestFocus();
-                }
+                const v = floatingWindow.findView('input_message');
+                if (v?.requestFocus)
+                    v.requestFocus();
             }
-            catch (error) {
-                logger.debug('Error requesting focus on input:', error);
-            }
+            catch (_) { }
         });
-        // 🔑 使用 editorAction 事件处理 Enter 键发送
         floatingWindow.on('input_message', 'editorAction', (event) => {
-            logger.debug('[ChatWindow] editorAction:', event);
-            if (event?.actionId === 6) { // IME_ACTION_DONE
+            if (event?.actionId === 6)
                 this.handleSendMessage();
-            }
         });
-        // --- Session panel ---
-        floatingWindow.on('btn_back_sessions', 'click', () => {
-            logger.debug('[ChatWindow] btn_back_sessions clicked');
-            this.showPanel('chat');
-        });
-        floatingWindow.on('btn_new_session', 'click', () => {
-            logger.info('[ChatWindow] btn_new_session clicked');
-            this.handleNewSession();
-        });
-        floatingWindow.on('btn_create_first', 'click', () => {
-            logger.info('[ChatWindow] btn_create_first clicked');
-            this.handleNewSession();
-        });
-        // --- Settings panel ---
-        floatingWindow.on('btn_back_settings', 'click', () => {
-            logger.debug('[ChatWindow] btn_back_settings clicked');
-            this.showPanel('chat');
-        });
-        floatingWindow.on('btn_save_settings', 'click', () => {
-            logger.info('[ChatWindow] btn_save_settings clicked');
-            this.handleSaveSettings();
-        });
-        logger.debug('[ChatWindow] Event listeners setup complete');
+        floatingWindow.on('btn_back_settings', 'click', () => this.showPanel('monitor'));
+        floatingWindow.on('btn_save_settings', 'click', () => this.handleSaveSettings());
     }
     // ==================================================
-    // Chat operations
+    // Panel switching
     // ==================================================
-    async handleSendMessage() {
-        try {
-            const inputView = floatingWindow.findView('input_message');
-            if (!inputView) {
-                logger.error('Input view not found');
-                return;
-            }
-            const message = floatingWindow.getText(inputView);
-            if (!message || message.trim() === '')
-                return;
-            floatingWindow.setText(inputView, '');
-            floatingWindow.setFocusable(false);
-            this.appendMessage({
-                id: generateViewId(),
-                role: 'user',
-                content: message,
-                timestamp: Date.now(),
-            });
-            const thinkingId = generateViewId();
-            this.appendThinking(thinkingId);
-            try {
-                const response = await this.agentManager.sendMessage(this.currentSessionId, message);
-                this.removeThinking(thinkingId);
-                this.appendMessage({
-                    id: generateViewId(),
-                    role: 'assistant',
-                    content: response.content,
-                    timestamp: Date.now(),
-                    attachments: response.attachments,
-                });
-                this.scrollToBottom();
-            }
-            catch (error) {
-                this.removeThinking(thinkingId);
-                this.appendMessage({
-                    id: generateViewId(),
-                    role: 'assistant',
-                    content: `错误: ${error.message}`,
-                    timestamp: Date.now(),
-                });
+    showPanel(panel) {
+        this.activePanel = panel;
+        const ids = {
+            monitor: 'monitor_panel',
+            settings: 'settings_panel',
+        };
+        for (const [key, viewId] of Object.entries(ids)) {
+            const view = floatingWindow.findView(viewId);
+            if (view && typeof view.setVisibility === 'function') {
+                view.setVisibility(key === panel ? 0 : 8);
             }
         }
-        catch (error) {
-            logger.error('Error handling send message:', error);
-        }
+        if (panel === 'settings')
+            this.populateSettings();
     }
-    appendMessage(message) {
-        const messageBubble = createMessageBubble({
-            role: message.role,
-            content: message.content,
-        }, message.id, message.attachments);
-        this.messageViewIds.push(message.id);
-        // 🔑 使用 addViewToParent 将消息添加到 messages_container
-        floatingWindow.addViewToParent('messages_container', messageBubble);
-        logger.debug(`[ChatWindow] Message ${message.id} added to messages_container`);
+    // ==================================================
+    // Process log
+    // ==================================================
+    addLogLine(text, color = '#CCCCCC') {
+        if (!this.isVisible)
+            return;
+        const viewId = generateViewId();
+        this.logViewIds.push(viewId);
+        floatingWindow.addViewToParent('log_container', `<TextView
+    android:id="@+id/${viewId}"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:text="${escapeXml(text)}"
+    android:textSize="11sp"
+    android:textColor="${color}"
+    android:fontFamily="monospace"
+    android:paddingTop="1dp"
+    android:paddingBottom="1dp"/>`);
+        this.scrollViewToBottom('scroll_log');
     }
-    appendThinking(indicatorId) {
-        floatingWindow.addViewToParent('messages_container', createThinkingIndicator(indicatorId));
-        logger.debug(`[ChatWindow] Thinking indicator ${indicatorId} added`);
-    }
-    removeThinking(indicatorId) {
-        floatingWindow.removeView(indicatorId);
-    }
-    clearMessages() {
-        for (const viewId of this.messageViewIds) {
+    clearLog() {
+        for (const viewId of this.logViewIds) {
             try {
                 floatingWindow.removeView(viewId);
             }
             catch (_) { }
         }
-        this.messageViewIds = [];
+        this.logViewIds = [];
     }
-    scrollToBottom() {
+    // ==================================================
+    // Status bar
+    // ==================================================
+    setStatus(text, busy) {
         try {
-            const scrollView = floatingWindow.findView('scroll_messages');
-            if (scrollView && scrollView.fullScroll) {
-                scrollView.fullScroll(130); // View.FOCUS_DOWN
+            const dot = floatingWindow.findView('status_dot');
+            const statusView = floatingWindow.findView('status_text');
+            if (dot)
+                floatingWindow.setText(dot, busy ? '●' : '○');
+            if (statusView)
+                floatingWindow.setText(statusView, ` ${text}`);
+        }
+        catch (_) { }
+    }
+    updateIterationView() {
+        try {
+            const iterView = floatingWindow.findView('iteration_text');
+            if (iterView && this.iterationCount > 0) {
+                floatingWindow.setText(iterView, `第 ${this.iterationCount} 轮`);
             }
         }
+        catch (_) { }
+    }
+    // ==================================================
+    // Streaming output
+    // ==================================================
+    updateStreamingOutput(accumulated, done) {
+        const now = Date.now();
+        if (!done && now - this.streamingLastUpdate < this.STREAM_THROTTLE_MS)
+            return;
+        this.streamingLastUpdate = now;
+        this.streamingAccum = accumulated;
+        try {
+            const outputView = floatingWindow.findView('output_text');
+            if (outputView) {
+                floatingWindow.setText(outputView, done ? accumulated : accumulated + '▊');
+            }
+            this.scrollViewToBottom('scroll_output');
+        }
+        catch (_) { }
+    }
+    scrollViewToBottom(scrollViewId) {
+        try {
+            const sv = floatingWindow.findView(scrollViewId);
+            if (sv?.fullScroll)
+                sv.fullScroll(130); // View.FOCUS_DOWN
+        }
+        catch (_) { }
+    }
+    // ==================================================
+    // Send message
+    // ==================================================
+    async handleSendMessage() {
+        if (this.isProcessing) {
+            logger.debug('[ChatWindow] Already processing, ignoring');
+            return;
+        }
+        try {
+            const inputView = floatingWindow.findView('input_message');
+            if (!inputView)
+                return;
+            const message = floatingWindow.getText(inputView);
+            if (!message?.trim())
+                return;
+            floatingWindow.setText(inputView, '');
+            floatingWindow.setFocusable(false);
+            this.isProcessing = true;
+            this.iterationCount = 0;
+            this.streamingAccum = '';
+            this.streamingLastUpdate = 0;
+            // Clear output area
+            try {
+                const outputView = floatingWindow.findView('output_text');
+                if (outputView)
+                    floatingWindow.setText(outputView, '');
+            }
+            catch (_) { }
+            this.addLogLine(`▶ ${message.substring(0, 100)}`, '#AAAAAA');
+            this.setStatus('思考中...', true);
+            this.updateIterationView();
+            const onStream = (_delta, accumulated, done) => {
+                this.updateStreamingOutput(accumulated, done);
+            };
+            try {
+                await this.agentManager.sendMessageWithStreaming(this.currentSessionId, message, onStream);
+                // Ensure final text is shown without cursor
+                this.updateStreamingOutput(this.streamingAccum, true);
+                this.setStatus('完成', false);
+                this.addLogLine('✔ 任务完成', '#81C784');
+            }
+            catch (error) {
+                const errMsg = (error.message || String(error)).substring(0, 120);
+                this.addLogLine(`✘ 错误: ${errMsg}`, '#EF9A9A');
+                try {
+                    const outputView = floatingWindow.findView('output_text');
+                    if (outputView)
+                        floatingWindow.setText(outputView, `处理出错:\n${errMsg}`);
+                }
+                catch (_) { }
+                this.setStatus('出错', false);
+            }
+            this.isProcessing = false;
+        }
         catch (error) {
-            logger.debug('ScrollToBottom failed:', error);
+            this.isProcessing = false;
+            logger.error('[ChatWindow] handleSendMessage error:', error);
         }
     }
     // ==================================================
-    // Session operations (embedded)
+    // Session management
     // ==================================================
     async initializeSession() {
         try {
             const activeSessions = this.agentManager.getActiveSessions();
             if (activeSessions.length > 0) {
                 this.currentSessionId = activeSessions[0];
-                await this.loadSessionHistory();
             }
             else {
                 const session = await this.agentManager.createSession({});
                 this.currentSessionId = session.sessionId;
             }
-            logger.info(`Initialized with session: ${this.currentSessionId}`);
+            logger.info(`[ChatWindow] Session: ${this.currentSessionId}`);
         }
         catch (error) {
-            logger.error('Error initializing session:', error);
-        }
-    }
-    async loadSessionHistory() {
-        if (!this.currentSessionId)
-            return;
-        try {
-            const session = this.agentManager.getSession(this.currentSessionId);
-            if (!session) {
-                logger.warn(`Session not found: ${this.currentSessionId}`);
-                return;
-            }
-            const context = session.buildContext();
-            for (const msg of context) {
-                if (msg.role === 'system')
-                    continue;
-                if (msg.role === 'user' || msg.role === 'assistant') {
-                    this.appendMessage({
-                        id: generateViewId(),
-                        role: msg.role,
-                        content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
-                        timestamp: msg.timestamp,
-                        attachments: msg.metadata?.attachments,
-                    });
-                }
-            }
-            this.scrollToBottom();
-        }
-        catch (error) {
-            logger.error('Error loading session history:', error);
+            logger.error('[ChatWindow] initializeSession error:', error);
         }
     }
     async handleNewSession() {
+        if (this.isProcessing)
+            return;
         try {
             const session = await this.agentManager.createSession({});
             this.currentSessionId = session.sessionId;
-            this.clearMessages();
-            this.showPanel('chat');
-            logger.info(`New session created: ${session.sessionId}`);
-        }
-        catch (error) {
-            logger.error('Error creating new session:', error);
-        }
-    }
-    /**
-     * Populate the embedded session list panel with current sessions
-     */
-    populateSessionList() {
-        // Clear previous session items
-        for (const viewId of this.sessionItemViewIds) {
+            this.iterationCount = 0;
+            this.clearLog();
             try {
-                floatingWindow.removeView(viewId);
+                const outputView = floatingWindow.findView('output_text');
+                if (outputView)
+                    floatingWindow.setText(outputView, '');
+                const iterView = floatingWindow.findView('iteration_text');
+                if (iterView)
+                    floatingWindow.setText(iterView, '');
             }
             catch (_) { }
-        }
-        this.sessionItemViewIds = [];
-        try {
-            const sessionIds = this.agentManager.getActiveSessions();
-            if (sessionIds.length === 0) {
-                // Show empty state, hide list
-                const emptyView = floatingWindow.findView('session_empty_state');
-                const listView = floatingWindow.findView('scroll_sessions');
-                if (emptyView)
-                    emptyView.setVisibility(0);
-                if (listView)
-                    listView.setVisibility(8);
-                return;
-            }
-            // Hide empty state, show list
-            const emptyView = floatingWindow.findView('session_empty_state');
-            const listView = floatingWindow.findView('scroll_sessions');
-            if (emptyView)
-                emptyView.setVisibility(8);
-            if (listView)
-                listView.setVisibility(0);
-            // Collect session info
-            const sessions = [];
-            for (const sessionId of sessionIds) {
-                const session = this.agentManager.getSession(sessionId);
-                if (!session)
-                    continue;
-                let lastMessage = '';
-                let lastUpdated = Date.now();
-                const context = session.buildContext();
-                if (context.length > 0) {
-                    const lastMsg = context[context.length - 1];
-                    if (lastMsg && lastMsg.role !== 'system') {
-                        lastMessage = typeof lastMsg.content === 'string'
-                            ? lastMsg.content
-                            : JSON.stringify(lastMsg.content);
-                        lastUpdated = lastMsg.timestamp;
-                    }
-                }
-                sessions.push({
-                    sessionId,
-                    title: `会话 ${sessionId.substring(0, 8)}`,
-                    lastMessage,
-                    lastUpdated,
-                    messageCount: session.getMessageTree().size,
-                });
-            }
-            sessions.sort((a, b) => b.lastUpdated - a.lastUpdated);
-            // Add session items. Highlight the current session.
-            for (const s of sessions) {
-                const isCurrent = s.sessionId === this.currentSessionId;
-                const itemId = `session_${s.sessionId}`;
-                this.sessionItemViewIds.push(itemId);
-                const timeStr = formatTimestamp(s.lastUpdated);
-                const preview = s.lastMessage ? escapeXml(s.lastMessage.substring(0, 50)) : '暂无消息';
-                const bgColor = isCurrent ? '#CC37474F' : '#CC1E1E1E';
-                const itemXml = `
-<LinearLayout
-    android:id="${itemId}"
-    android:layout_width="match_parent"
-    android:layout_height="wrap_content"
-    android:orientation="vertical"
-    android:padding="16dp"
-    android:background="${bgColor}"
-    android:clickable="true">
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <TextView
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="${escapeXml(s.title)}"
-            android:textSize="16sp"
-            android:textColor="#EAEAEA"
-            android:textStyle="bold"/>
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="${timeStr}"
-            android:textSize="12sp"
-            android:textColor="#AAAAAA"/>
-    </LinearLayout>
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="${preview}"
-        android:textSize="14sp"
-        android:textColor="#AAAAAA"
-        android:layout_marginTop="4dp"
-        android:maxLines="2"
-        android:ellipsize="end"/>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="1dp"
-        android:background="#444444"
-        android:layout_marginTop="16dp"/>
-</LinearLayout>`;
-                floatingWindow.addViewToParent('session_list_container', itemXml);
-                // 🔑 为每个动态添加的 session item 注册点击事件
-                const sessionId = s.sessionId;
-                floatingWindow.on(itemId, 'click', () => {
-                    logger.info(`[ChatWindow] Session item clicked: ${sessionId}`);
-                    this.switchSession(sessionId);
-                });
-            }
+            this.setStatus('空闲', false);
+            logger.info(`[ChatWindow] New session: ${session.sessionId}`);
         }
         catch (error) {
-            logger.error('Error populating session list:', error);
+            logger.error('[ChatWindow] handleNewSession error:', error);
         }
     }
     // ==================================================
-    // Settings operations (embedded)
+    // Settings
     // ==================================================
-    /**
-     * Populate settings fields with current config values
-     */
     populateSettings() {
         try {
             const providerView = floatingWindow.findView('settings_provider');
-            if (providerView) {
+            if (providerView)
                 floatingWindow.setText(providerView, this.config.model.provider || 'anthropic');
-            }
             const modelView = floatingWindow.findView('settings_model');
-            if (modelView) {
+            if (modelView)
                 floatingWindow.setText(modelView, this.config.model.model);
-            }
             const maxTokensView = floatingWindow.findView('settings_max_tokens');
-            if (maxTokensView) {
+            if (maxTokensView)
                 floatingWindow.setText(maxTokensView, this.config.model.maxTokens.toString());
-            }
             const tempView = floatingWindow.findView('settings_temperature');
-            if (tempView) {
+            if (tempView)
                 floatingWindow.setText(tempView, this.config.model.temperature.toString());
-            }
         }
         catch (error) {
-            logger.error('Error populating settings:', error);
+            logger.error('[ChatWindow] populateSettings error:', error);
         }
     }
-    /**
-     * Save settings from the embedded settings panel
-     */
     handleSaveSettings() {
         try {
             const modelView = floatingWindow.findView('settings_model');
@@ -915,14 +777,26 @@ export class ChatWindow {
                 if (!isNaN(temp) && temp >= 0)
                     this.config.model.temperature = temp;
             }
-            if (this.onConfigSaveCallback) {
-                this.onConfigSaveCallback(this.config);
-            }
-            logger.info('Settings saved from floating window');
-            this.showPanel('chat');
+            this.onConfigSaveCallback?.(this.config);
+            this.showPanel('monitor');
+            logger.info('[ChatWindow] Settings saved');
         }
         catch (error) {
-            logger.error('Error saving settings:', error);
+            logger.error('[ChatWindow] handleSaveSettings error:', error);
+        }
+    }
+    // ==================================================
+    // Helpers
+    // ==================================================
+    formatArgs(args) {
+        try {
+            return Object.entries(args)
+                .slice(0, 2)
+                .map(([k, v]) => `${k}=${String(v).substring(0, 25)}`)
+                .join(', ');
+        }
+        catch {
+            return '';
         }
     }
 }

@@ -141,12 +141,13 @@ export class Lane extends EventEmitter {
   }
 
   /**
-   * Execute with timeout
+   * Execute with timeout. Pass timeoutMs=0 to disable the timeout entirely.
    */
   private executeWithTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number
   ): Promise<T> {
+    if (timeoutMs <= 0) return promise; // 0 = no timeout
     return Promise.race([
       promise,
       new Promise<T>((_, reject) =>
