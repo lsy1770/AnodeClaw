@@ -102,8 +102,15 @@ export class StreamingHandler extends EventEmitter {
    * Dispatch event to all subscribers
    */
   private dispatch(event: AnyStreamEvent): void {
-    // Emit on EventEmitter for internal listeners
-    this.emit(event.type, event);
+    // Avoid Node's reserved "error" event throwing when no listener is attached.
+    if (event.type === 'error') {
+      this.emit('stream_error', event);
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', event);
+      }
+    } else {
+      this.emit(event.type, event);
+    }
     this.emit('event', event);
 
     // Call all subscription handlers
@@ -157,8 +164,8 @@ export class StreamingHandler extends EventEmitter {
    * Emit agent start event
    */
   emitAgentStart(sessionId: string, runId: string): void {
-    this.currentRunId = runId;
     this.reset();
+    this.currentRunId = runId;
 
     const event: AgentStartEvent = {
       type: 'agent_start',

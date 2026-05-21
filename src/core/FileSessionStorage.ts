@@ -16,6 +16,7 @@ declare const file: {
   delete(path: string): Promise<boolean>;
   createDirectory(path: string): Promise<boolean>;
   copy(source: string, target: string): Promise<boolean>;
+  join?(...paths: string[]): string;
   listFiles(path: string): Promise<Array<{ name: string; path: string; size: number; isDirectory: boolean; lastModified: number; extension: string }>>;
 };
 
@@ -242,9 +243,12 @@ export class FileSessionStorage implements SessionStorage {
       for (const f of files) {
         if (!f.endsWith('.json') || f.endsWith('.export.json')) continue;
 
-        const fullPath = sessionDir.endsWith('/') || sessionDir.endsWith('\\')
-          ? `${sessionDir}${f}`
-          : `${sessionDir}/${f}`;
+        const fullPath =
+          typeof file !== 'undefined' && typeof file.join === 'function'
+            ? file.join(sessionDir, f)
+            : (sessionDir.endsWith('/') || sessionDir.endsWith('\\')
+                ? `${sessionDir}${f}`
+                : `${sessionDir}/${f}`);
 
         try {
           const storage = new FileSessionStorage(fullPath);
@@ -287,7 +291,10 @@ export class FileSessionStorage implements SessionStorage {
 
   private async writeFile(path: string, content: string): Promise<void> {
     if (typeof file !== 'undefined' && file.writeText) {
-      await file.writeText(path, content, 'UTF-8');
+      const result = await file.writeText(path, content, 'UTF-8');
+      if (!result) {
+        throw new Error(`Write operation returned false for ${path}`);
+      }
       return;
     }
     throw new Error('Anode file API not available');
@@ -309,16 +316,52 @@ export class FileSessionStorage implements SessionStorage {
   }
 
   private async ensureDirectory(filePath: string): Promise<void> {
-    const lastSlash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
-    const dir = lastSlash > 0 ? filePath.substring(0, lastSlash) : '.';
-
-    try {
-      if (typeof file !== 'undefined' && file.createDirectory) {
-        await file.createDirectory(dir);
-        return;
-      }
-    } catch {
-      // Directory may already exist
+    const dir = this.dirname(filePath);
+    if (!dir || dir === '.' || this.fileExists(dir)) {
+      return;
     }
+
+    const parent = this.dirname(dir);
+    if (parent && parent !== dir && parent !== '.') {
+      await this.ensureDirectory(this.joinPath(parent, '__dir__.tmp'));
+    }
+
+    if (typeof file !== 'undefined' && file.createDirectory) {
+      try {
+        const created = await file.createDirectory(dir);
+        if (!created && !this.fileExists(dir)) {
+          throw new Error(`createDirectory returned false for ${dir}`);
+        }
+      } catch (error) {
+        if (!this.fileExists(dir)) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  private dirname(path: string): string {
+    const normalized = path.replace(/\\/g, '/');
+    const lastSlash = normalized.lastIndexOf('/');
+    if (lastSlash <= 0) {
+      return lastSlash === 0 ? '/' : '.';
+    }
+    return normalized.substring(0, lastSlash);
+  }
+
+  private joinPath(...parts: string[]): string {
+    if (typeof file !== 'undefined' && typeof file.join === 'function') {
+      return file.join(...parts);
+    }
+
+    return parts
+      .filter((part) => part.length > 0)
+      .map((part, index) => {
+        if (index === 0) {
+          return part.replace(/[\\/]+$/, '');
+        }
+        return part.replace(/^[\\/]+|[\\/]+$/g, '');
+      })
+      .join('/');
   }
 }

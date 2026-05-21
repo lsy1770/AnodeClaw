@@ -17,6 +17,12 @@
     // Optional: Custom API base URL
     // baseURL: 'https://api.anthropic.com',
 
+    // OpenAI-compatible API mode:
+    // - 'auto': automatically choose and fallback between Responses API and chat.completions
+    // - 'responses': force /v1/responses only
+    // - 'chat.completions': force /v1/chat/completions only
+    apiMode: 'auto',
+
     // Maximum tokens per request
     maxTokens: 4096,
 
@@ -75,6 +81,18 @@
     maxToolIterations: 20,
   },
 
+  // Skills configuration (Progressive Disclosure)
+  skills: {
+    // Enable skill system
+    enabled: true,
+
+    // Directory for bundled skills (shipped with app)
+    bundledDir: './assets/skills',
+
+    // Directory for user/workspace skills (overrides bundled)
+    workspaceDir: './skills',
+  },
+
   // Safety and approval configuration
   safety: {
     // Enable safety system
@@ -116,6 +134,29 @@
       enabled: true,
       showProgress: true,
     },
+  },
+
+  // Image Generation configuration (Z-Image / DashScope)
+  imageGeneration: {
+    // DashScope API Key - can use environment variable substitution
+    // Get your key from: https://bailian.console.aliyun.com/
+    apiKey: '${DASHSCOPE_API_KEY}',
+
+    // Model name (currently only z-image-turbo is available)
+    model: 'z-image-turbo',
+
+    // API base URL
+    // Beijing: https://dashscope.aliyuncs.com (default)
+    // Singapore: https://dashscope-intl.aliyuncs.com
+    baseURL: 'https://dashscope.aliyuncs.com',
+
+    // Default image size (width*height)
+    // Total pixels must be in [512*512, 2048*2048]
+    // Recommended: 1024*1536 (2:3 portrait), 1536*1024 (3:2 landscape), 1024*1024 (1:1 square)
+    defaultSize: '1024*1536',
+
+    // Default output directory for generated images
+    outputDir: './data/generated',
   },
 
   // Social platform configuration (optional)

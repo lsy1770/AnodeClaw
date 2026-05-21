@@ -27,6 +27,7 @@ export interface SocialMessage {
 export interface SocialAttachment {
   type: 'image' | 'file' | 'audio' | 'video';
   url: string;
+  localPath?: string;
   filename?: string;
   size?: number;
   mimeType?: string;

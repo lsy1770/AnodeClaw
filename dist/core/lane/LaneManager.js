@@ -19,19 +19,6 @@ export class LaneManager {
         if (!this.lanes.has(laneId)) {
             const lane = new Lane(laneId);
             this.lanes.set(laneId, lane);
-            // Listen to lane events
-            lane.on('task:start', (data) => {
-                logger.info(`[Lane:${laneId}] Task started: ${data.taskName}`);
-            });
-            lane.on('task:success', (data) => {
-                logger.info(`[Lane:${laneId}] Task success: ${data.taskId} (${data.executionTime}ms)`);
-            });
-            lane.on('task:error', (data) => {
-                logger.error(`[Lane:${laneId}] Task error: ${data.taskId}:`, data.error.message);
-            });
-            lane.on('queue:empty', () => {
-                logger.info(`[Lane:${laneId}] Queue empty`);
-            });
             logger.info(`[LaneManager] Created new lane: ${laneId}`);
         }
         return this.lanes.get(laneId);

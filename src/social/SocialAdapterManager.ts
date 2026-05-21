@@ -32,6 +32,8 @@ export class SocialAdapterManager {
   private platformMessageHandlers: Map<string, MessageHandler[]> = new Map();
   private lastActiveChannels: Map<string, string> = new Map();
   private defaultBroadcastChannels: Map<string, string> = new Map();
+  private recentMessageIds: Map<string, number> = new Map();
+  private readonly duplicateWindowMs = 5 * 60 * 1000;
 
   /**
    * Register an adapter
@@ -274,6 +276,13 @@ export class SocialAdapterManager {
    * @param message Incoming message
    */
   private async handleMessage(message: SocialMessage): Promise<void> {
+    if (this.isDuplicateMessage(message)) {
+      logger.debug(
+        `[SocialAdapter] Ignoring duplicate message from ${message.platform}: ${message.messageId}`
+      );
+      return;
+    }
+
     logger.info(
       `[SocialAdapter] Received message from ${message.platform}: ${message.text.substring(0, 50)}...`
     );
@@ -302,6 +311,31 @@ export class SocialAdapterManager {
       }
     } catch (error) {
       logger.error('[SocialAdapter] Message handling error:', error);
+    }
+  }
+
+  private isDuplicateMessage(message: SocialMessage): boolean {
+    this.pruneRecentMessageIds();
+
+    if (!message.messageId) {
+      return false;
+    }
+
+    const key = `${message.platform}:${message.chatId}:${message.messageId}`;
+    if (this.recentMessageIds.has(key)) {
+      return true;
+    }
+
+    this.recentMessageIds.set(key, Date.now());
+    return false;
+  }
+
+  private pruneRecentMessageIds(): void {
+    const now = Date.now();
+    for (const [key, timestamp] of this.recentMessageIds.entries()) {
+      if (now - timestamp > this.duplicateWindowMs) {
+        this.recentMessageIds.delete(key);
+      }
     }
   }
 

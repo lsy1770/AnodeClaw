@@ -9,6 +9,7 @@ import { logger } from '../utils/logger.js';
  */
 export class PluginLoader {
     constructor(pluginDir, fileAPI) {
+        this.reservedDirectories = new Set(['builtin']);
         this.pluginDir = pluginDir;
         this.fileAPI = fileAPI;
         logger.info(`[PluginLoader] Initialized with plugin directory: ${pluginDir}`);
@@ -126,6 +127,16 @@ export class PluginLoader {
             logger.info(`[PluginLoader] Found ${pluginDirs.length} plugin directories`);
             // Load each plugin
             for (const dir of pluginDirs) {
+                if (this.reservedDirectories.has(dir.name)) {
+                    logger.debug(`[PluginLoader] Skipping reserved directory: ${dir.name}`);
+                    continue;
+                }
+                const metadataPath = `${this.pluginDir}/${dir.name}/plugin.json`;
+                const hasMetadata = await this.fileAPI.exists(metadataPath);
+                if (!hasMetadata) {
+                    logger.debug(`[PluginLoader] Skipping non-plugin directory: ${dir.name}`);
+                    continue;
+                }
                 const result = await this.load(dir.name);
                 results.set(dir.name, result);
                 if (result.success) {

@@ -17,8 +17,10 @@ import { logger } from '../utils/logger.js';
 // 基于 FileAPI.kt 的实际函数签名
 declare const file: {
   readText(path: string, charset?: string): Promise<string>;
-  writeText(path: string, content: string, charset?: string): Promise<void>;
+  writeText(path: string, content: string, charset?: string): Promise<boolean | void>;
   exists(path: string): boolean;
+  createDirectory?(path: string): Promise<boolean | void>;
+  join?(...paths: string[]): string;
 };
 
 /** Change listener callback type */
@@ -435,10 +437,41 @@ export class ConfigManager {
    */
   private async writeFile(path: string, content: string): Promise<void> {
     if (typeof file !== 'undefined' && file.writeText) {
-      await file.writeText(path, content, 'UTF-8');
+      await this.ensureParentDirectory(path);
+      const result = await file.writeText(path, content, 'UTF-8');
+      if (result === false) {
+        throw new Error(`Write operation returned false for ${path}`);
+      }
       return;
     }
     throw new Error('Anode file API not available');
+  }
+
+  private async ensureParentDirectory(path: string): Promise<void> {
+    if (typeof file === 'undefined' || typeof file.createDirectory !== 'function') {
+      return;
+    }
+
+    const dir = this.dirname(path);
+    if (!dir || dir === '.' || file.exists(dir)) {
+      return;
+    }
+
+    const parent = this.dirname(dir);
+    if (parent && parent !== dir && parent !== '.') {
+      await this.ensureParentDirectory(this.resolvePath(parent, '__dir__.tmp'));
+    }
+
+    try {
+      const created = await file.createDirectory(dir);
+      if (created === false && !file.exists(dir)) {
+        throw new Error(`createDirectory returned false for ${dir}`);
+      }
+    } catch (error) {
+      if (!file.exists(dir)) {
+        throw error;
+      }
+    }
   }
 
   /**

@@ -25,6 +25,150 @@
  */
 import { z } from 'zod';
 import { logger } from '../../utils/logger.js';
+const SCREEN_CAPTURE_PERMISSION_CONFIRM_LABELS = [
+    '立即开始',
+    '开始',
+    '开始录制',
+    '开始投屏',
+    '允许',
+    '允许录屏',
+    '允许截屏',
+    '允许投射',
+    '同意',
+    '确认',
+    '继续',
+    'Start now',
+    'Start',
+    'Allow',
+    'OK',
+    'Continue',
+];
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function getErrorMessage(error) {
+    if (error instanceof Error)
+        return error.message;
+    if (typeof error === 'string')
+        return error;
+    try {
+        return JSON.stringify(error);
+    }
+    catch {
+        return String(error);
+    }
+}
+function getNodeBounds(bounds) {
+    if (!bounds)
+        return null;
+    const { left, top, right, bottom } = bounds;
+    if ([left, top, right, bottom].some((value) => typeof value !== 'number' || Number.isNaN(value))) {
+        return null;
+    }
+    return { left, top, right, bottom };
+}
+async function clickNodeWithFallback(node) {
+    if (!node)
+        return false;
+    try {
+        const clicked = await node.click();
+        if (clicked)
+            return true;
+    }
+    catch (error) {
+        logger.debug('[android_request_screen_capture] node.click() failed:', error);
+    }
+    const bounds = getNodeBounds(node.bounds);
+    if (!bounds)
+        return false;
+    const centerX = Math.round((bounds.left + bounds.right) / 2);
+    const centerY = Math.round((bounds.top + bounds.bottom) / 2);
+    try {
+        return await auto.click(centerX, centerY);
+    }
+    catch (error) {
+        logger.debug('[android_request_screen_capture] coordinate fallback failed:', error);
+        return false;
+    }
+}
+async function findScreenCapturePermissionNode(label) {
+    const exactSelector = auto.selector();
+    exactSelector.text(label);
+    let node = await auto.findOne(exactSelector);
+    if (node)
+        return node;
+    if (label.length > 1) {
+        const containsSelector = auto.selector();
+        containsSelector.textContains(label);
+        node = await auto.findOne(containsSelector);
+        if (node)
+            return node;
+    }
+    const descSelector = auto.selector();
+    descSelector.desc(label);
+    return await auto.findOne(descSelector);
+}
+async function autoApproveScreenCapturePermissionDialog(timeoutMs = 8000) {
+    try {
+        await auto.clearWindowFilter();
+    }
+    catch (error) {
+        logger.debug('[android_request_screen_capture] Failed to clear window filter before approval scan:', error);
+    }
+    const start = Date.now();
+    let attempts = 0;
+    while (Date.now() - start < timeoutMs) {
+        attempts++;
+        for (const label of SCREEN_CAPTURE_PERMISSION_CONFIRM_LABELS) {
+            try {
+                const node = await findScreenCapturePermissionNode(label);
+                if (!node)
+                    continue;
+                const clicked = await clickNodeWithFallback(node);
+                if (clicked) {
+                    logger.info(`[android_request_screen_capture] Auto-clicked permission button: ${label}`);
+                    await delay(500);
+                    return { clicked: true, label, attempts };
+                }
+            }
+            catch (error) {
+                logger.debug(`[android_request_screen_capture] Failed while probing label "${label}":`, error);
+            }
+        }
+        await delay(300);
+    }
+    return { clicked: false, attempts };
+}
+async function requestScreenCapturePermissionWithAutoApproval(timeoutMs = 8000) {
+    const approvalPromise = autoApproveScreenCapturePermissionDialog(timeoutMs).catch((error) => {
+        logger.warn('[android_request_screen_capture] Auto-approval scan failed:', error);
+        return { clicked: false, attempts: 0 };
+    });
+    const requestResult = await image.requestScreenCapturePermission();
+    const approval = await approvalPromise;
+    return {
+        requestResult,
+        autoApproved: approval.clicked,
+        clickedLabel: approval.label,
+        attempts: approval.attempts,
+    };
+}
+function isScreenCapturePermissionError(error) {
+    const message = getErrorMessage(error).toLowerCase();
+    return /permission|media.?projection|screen capture|capture screen|not granted|denied|consent/.test(message);
+}
+async function isAccessibilityScreenshotSupported() {
+    if (typeof image.isAccessibilityScreenshotSupported !== 'function') {
+        return true;
+    }
+    try {
+        return await image.isAccessibilityScreenshotSupported();
+    }
+    catch (error) {
+        logger.debug('[android_screenshot] Failed to query accessibility screenshot support:', error);
+        return true;
+    }
+}
 /**
  * Android Click Tool
  */
@@ -218,7 +362,7 @@ export const androidFindTextTool = {
         {
             name: 'exact',
             description: 'Match exact text (default: false for partial match)',
-            schema: z.coerce.boolean(), // �?Auto-convert strings to boolean
+            schema: z.coerce.boolean(), // Auto-convert strings to boolean
             required: false,
             default: false,
         },
@@ -382,7 +526,7 @@ export const androidInputTextTool = {
  */
 export const androidRequestScreenCaptureTool = {
     name: 'android_request_screen_capture',
-    description: 'Request screen capture permission. MUST be called BEFORE android_screenshot (unless using useAccessibility=true). This shows a system dialog asking user to grant permission.',
+    description: 'Request screen capture permission. MUST be called BEFORE android_screenshot (unless using useAccessibility=true). This shows a system dialog and automatically tries to click common confirm buttons such as Allow / Start now.',
     category: 'android',
     permissions: ['android:permission'],
     parallelizable: false,
@@ -390,12 +534,17 @@ export const androidRequestScreenCaptureTool = {
     async execute(params, options) {
         try {
             logger.debug('Requesting screen capture permission');
-            await image.requestScreenCapturePermission();
+            const permission = await requestScreenCapturePermissionWithAutoApproval();
             return {
                 success: true,
                 output: {
                     action: 'request_screen_capture',
-                    message: 'Screen capture permission requested successfully',
+                    autoApproved: permission.autoApproved,
+                    clickedLabel: permission.clickedLabel ?? null,
+                    attempts: permission.attempts,
+                    message: permission.autoApproved
+                        ? 'Screen capture permission granted and confirmed automatically'
+                        : 'Screen capture permission requested; if the system dialog remains visible, confirm it manually',
                 },
             };
         }
@@ -418,7 +567,7 @@ export const androidRequestScreenCaptureTool = {
  */
 export const androidScreenshotTool = {
     name: 'android_screenshot',
-    description: 'Capture a screenshot. PREREQUISITES: 1) You MUST call android_request_screen_capture FIRST to get permission (unless using useAccessibility=true). 2) Provide "path" parameter to save file (e.g., "./screenshots/screen.png"), otherwise only base64 data is returned.',
+    description: 'Capture a screenshot. PREREQUISITES: 1) Usually call android_request_screen_capture first unless using useAccessibility=true. 2) Provide "path" to save a file (e.g., "./screenshots/screen.png"), otherwise only base64 is returned. When a file is saved, the host also returns an image attachment that can be sent to the user on media-capable channels.',
     category: 'android',
     permissions: ['android:read'],
     parallelizable: true,
@@ -457,13 +606,34 @@ export const androidScreenshotTool = {
             logger.debug(`Android screenshot (format: ${format}, path: ${path || 'base64'})`);
             // Capture screenshot
             let bitmap;
+            let permissionRetry;
             if (useAccessibility) {
+                const supported = await isAccessibilityScreenshotSupported();
+                if (!supported) {
+                    throw new Error('Accessibility screenshot requires Android 11 or higher on this device. Use useAccessibility=false and let MediaProjection permission be granted instead.');
+                }
                 // Accessibility mode doesn't need permission
                 bitmap = await image.captureScreenWithAccessibility();
             }
             else {
                 // MediaProjection mode - permission should have been requested first
-                bitmap = await image.captureScreen();
+                try {
+                    bitmap = await image.captureScreen();
+                }
+                catch (error) {
+                    if (!isScreenCapturePermissionError(error)) {
+                        throw error;
+                    }
+                    logger.warn('[android_screenshot] captureScreen failed, retrying after requesting permission:', error);
+                    const permission = await requestScreenCapturePermissionWithAutoApproval();
+                    permissionRetry = {
+                        autoApproved: permission.autoApproved,
+                        clickedLabel: permission.clickedLabel,
+                        attempts: permission.attempts,
+                    };
+                    await delay(700);
+                    bitmap = await image.captureScreen();
+                }
             }
             if (!bitmap) {
                 throw new Error('Failed to capture screen - null bitmap returned');
@@ -489,7 +659,8 @@ export const androidScreenshotTool = {
                         path,
                         format,
                         quality,
-                        message: 'Screenshot saved successfully',
+                        permissionRetry,
+                        message: 'Screenshot saved successfully and attached as an image result',
                     },
                     attachments: [{
                             type: 'image',
@@ -507,6 +678,7 @@ export const androidScreenshotTool = {
                         action: 'screenshot',
                         format,
                         base64,
+                        permissionRetry,
                         message: 'Screenshot captured as base64 data (no path specified - provide "path" parameter to save to file)',
                     },
                 };
@@ -955,9 +1127,23 @@ export const androidPressTool = {
  * Android Gesture Tool
  * Perform a gesture along a path of points
  */
+const androidGesturePointSchema = z.object({
+    x: z.number().int().min(0),
+    y: z.number().int().min(0),
+});
+const androidGesturePointsSchema = z.preprocess((value) => {
+    if (!Array.isArray(value))
+        return value;
+    return value.map((point) => {
+        if (Array.isArray(point) && point.length >= 2) {
+            return { x: point[0], y: point[1] };
+        }
+        return point;
+    });
+}, z.array(androidGesturePointSchema).min(2));
 export const androidGestureTool = {
     name: 'android_gesture',
-    description: 'Perform a gesture along a path of points over a given duration. Points format: [{x, y}, ...] or [[x, y], ...]',
+    description: 'Perform a gesture along a path of points over a given duration. Points format: [{x, y}, ...].',
     category: 'android',
     permissions: ['android:interact'],
     parallelizable: false,
@@ -970,8 +1156,8 @@ export const androidGestureTool = {
         },
         {
             name: 'points',
-            description: 'Array of points: [{x, y}, ...] or [[x, y], ...]',
-            schema: z.array(z.any()).min(2),
+            description: 'Array of points: [{x, y}, ...]',
+            schema: androidGesturePointsSchema,
             required: true,
         },
     ],
@@ -1010,10 +1196,24 @@ export const androidGesturesTool = {
         {
             name: 'strokes',
             description: 'Array of stroke objects: [{duration: number, points: [{x, y}, ...]}, ...]',
-            schema: z.array(z.object({
+            schema: z.preprocess((value) => {
+                if (!Array.isArray(value))
+                    return value;
+                return value.map((stroke) => ({
+                    ...stroke,
+                    points: Array.isArray(stroke?.points)
+                        ? stroke.points.map((point) => {
+                            if (Array.isArray(point) && point.length >= 2) {
+                                return { x: point[0], y: point[1] };
+                            }
+                            return point;
+                        })
+                        : stroke?.points,
+                }));
+            }, z.array(z.object({
                 duration: z.number().int().min(1),
-                points: z.array(z.any()).min(1),
-            })).min(1),
+                points: z.array(androidGesturePointSchema).min(1),
+            })).min(1)),
             required: true,
         },
     ],
@@ -1612,7 +1812,7 @@ export const androidGetLayoutTool = {
             description: 'Only include interactive elements (clickable/scrollable/editable). RECOMMENDED: true to avoid 30s+ timeout (default: true)',
             schema: z.coerce.boolean(),
             required: false,
-            default: true, // �?Changed from false to true for performance
+            default: true, // Default to true for better performance
         },
         {
             name: 'maxDepth',
@@ -1640,12 +1840,12 @@ export const androidGetLayoutTool = {
             catch (e) {
                 logger.warn('Failed to clear window filter:', e);
             }
-            // �?优化：使用限制性selector减少节点数量
+            // Optimization: use restrictive selectors to reduce node count.
             let selector = auto.selector();
-            // 如果只需要可见元素，在selector层面过滤（但ACS可能不支持visible selector�?
+            // Filter visible elements at selector level when supported by ACS.
             // 如果只需要交互元素，使用clickable/scrollable/editable selector
             if (interactiveOnly) {
-                // 获取所有可交互的节点（clickable OR scrollable OR editable�?
+                // Fetch interactive nodes only: clickable, scrollable, or editable.
                 const clickableNodes = await auto.findAll(auto.selector().clickable(true));
                 const scrollableNodes = await auto.findAll(auto.selector().scrollable(true));
                 const editableNodes = await auto.findAll(auto.selector().editable(true));
@@ -1681,9 +1881,9 @@ export const androidGetLayoutTool = {
                     },
                 };
             }
-            // �?原来的方法：findAll(空selector)会返回整个树的所有节点，非常慢！
+            // Avoid findAll(empty selector), which returns the whole tree and is slow.
             // 如果需要完整树，我们必须接受性能开销
-            // 但至少可以限制数�?
+            // Limit the number of processed nodes as a fallback.
             logger.warn('Getting full layout tree - this may be slow on complex UIs');
             const allNodes = await auto.findAll(selector);
             if (!allNodes || allNodes.length === 0) {
@@ -1697,7 +1897,7 @@ export const androidGetLayoutTool = {
                 };
             }
             logger.debug(`findAll returned ${allNodes.length} nodes`);
-            // 如果返回节点太多，限制处理数�?
+            // Limit processing if the selector still returns too many nodes.
             const MAX_NODES = 200;
             if (allNodes.length > MAX_NODES) {
                 logger.warn(`Too many nodes (${allNodes.length}), limiting to ${MAX_NODES} for performance`);
@@ -1784,7 +1984,7 @@ export const androidFindInteractiveElementsTool = {
             catch (e) {
                 logger.warn('Failed to clear window filter:', e);
             }
-            // �?优化：直接使用selector过滤，避免获取所有节�?
+            // Optimization: filter with selectors to avoid fetching every node.
             logger.debug('Using optimized selector-based search...');
             // 分别查找clickable, scrollable, editable元素
             const [clickableNodes, scrollableNodes, editableNodes] = await Promise.all([
@@ -1793,7 +1993,7 @@ export const androidFindInteractiveElementsTool = {
                 auto.findAll(auto.selector().editable(true)),
             ]);
             logger.debug(`Found: ${clickableNodes.length} clickable, ${scrollableNodes.length} scrollable, ${editableNodes.length} editable`);
-            // 合并并去重（基于bounds位置�?
+            // Merge and deduplicate by bounds position.
             const nodeMap = new Map();
             const addNode = (node, type) => {
                 if (!node)
@@ -1823,7 +2023,7 @@ export const androidFindInteractiveElementsTool = {
             if (visibleOnly) {
                 elements = elements.filter(e => e.visible);
             }
-            // 按类型分组统�?
+            // Group statistics by element type.
             const clickable = elements.filter(e => e.clickable);
             const scrollable = elements.filter(e => e.scrollable);
             const editable = elements.filter(e => e.editable);
@@ -1886,7 +2086,7 @@ export const androidDescribeScreenTool = {
                 auto.getCurrentActivity(),
                 auto.getWindows(),
             ]);
-            // �?优化：使用限制性selector直接查找交互元素和文本元�?
+            // Optimization: use restrictive selectors to find interactive and text elements.
             logger.debug('Getting interactive and text elements with optimized selectors...');
             const [clickableNodes, scrollableNodes, editableNodes] = await Promise.all([
                 auto.findAll(auto.selector().clickable(true)),
@@ -1916,7 +2116,7 @@ export const androidDescribeScreenTool = {
             editableNodes.forEach(addInteractive);
             const interactiveElements = Array.from(interactiveMap.values()).slice(0, 30);
             // 获取文本元素 - 使用textContains查找有文本的元素
-            // 注意：可能没有直接的"有文�?selector，所以用clickable元素中的文本
+            // Text-only selectors may not be available, so reuse text from clickable elements.
             const textElements = interactiveElements
                 .filter(e => e.text && e.text.length > 0)
                 .map(e => ({

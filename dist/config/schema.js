@@ -10,6 +10,7 @@ export const ModelConfigSchema = z.object({
     model: z.string().default('claude-sonnet-4-5-20250929'),
     apiKey: z.string(),
     baseURL: z.string().optional(),
+    apiMode: z.enum(['auto', 'responses', 'chat.completions']).default('auto'),
     maxTokens: z.number().int().positive().default(4096),
     temperature: z.number().min(0).max(2).default(1.0),
 });
@@ -119,12 +120,30 @@ export const SafetyConfigSchema = z.object({
     approvalPlatform: z.enum(['telegram', 'discord', 'qq', 'wechat', 'feishu', 'dingtalk']).default('telegram'),
 }).optional();
 /**
+ * Skills configuration schema
+ */
+export const SkillsConfigSchema = z.object({
+    enabled: z.boolean().default(true),
+    bundledDir: z.string().default('./assets/skills'),
+    workspaceDir: z.string().default('./skills'),
+});
+/**
  * Memory configuration schema
  */
 export const MemoryConfigSchema = z.object({
     enabled: z.boolean().default(true),
     useVectorSearch: z.boolean().default(true),
 });
+/**
+ * Image Generation configuration schema (Z-Image / DashScope)
+ */
+export const ImageGenerationConfigSchema = z.object({
+    apiKey: z.string().default(''),
+    model: z.string().default('z-image-turbo'),
+    baseURL: z.string().default('https://dashscope.aliyuncs.com'),
+    defaultSize: z.string().regex(/^\d+\*\d+$/).default('1024*1536'),
+    outputDir: z.string().default('./data/generated'),
+}).optional();
 /**
  * Main configuration schema
  */
@@ -133,7 +152,9 @@ export const ConfigSchema = z.object({
     storage: StorageConfigSchema,
     agent: AgentConfigSchema,
     ui: UIConfigSchema.optional(), // UI 配置是可选的（CLI 模式不需要）
+    skills: SkillsConfigSchema.optional(), // Skills 配置（可选）
     memory: MemoryConfigSchema.optional(), // 记忆系统配置（可选）
+    imageGeneration: ImageGenerationConfigSchema, // 图片生成配置（可选）
     social: SocialPlatformConfigSchema.optional(), // 社交平台配置（可选）
     proactive: ProactiveConfigSchema, // 主动行为配置（可选）
     safety: SafetyConfigSchema, // 安全和审批配置（可选）

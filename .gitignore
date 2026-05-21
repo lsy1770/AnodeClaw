@@ -41,6 +41,21 @@ sessions/
 *.tmp
 *.temp
 .cache/
+NUL
+nul
+**/NUL
+**/nul
+
+# Generated deployment bundles
+anodeClawd-V2/
+deploy-package/
+
+# Local diagnosis / ad-hoc validation scripts
+diagnose-*.js
+verify-fix.js
+test-*.js
+test-*.ts
+cron-examples.js
 
 # npm debug
 npm-debug.log*

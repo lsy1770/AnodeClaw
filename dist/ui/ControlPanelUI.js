@@ -18,6 +18,7 @@ const VIEW_IDS = [
     'btn_save', 'btn_start_chat', 'btn_stop_chat',
     // Radio buttons
     'radio_anthropic', 'radio_openai', 'radio_gemini',
+    'radio_api_mode_auto', 'radio_api_mode_responses', 'radio_api_mode_chat',
     // AI config fields
     'edit_api_key', 'edit_model', 'edit_max_tokens', 'edit_temperature',
     'edit_base_url', 'edit_system_prompt',
@@ -44,6 +45,7 @@ const CHECKBOX_IDS = [
 ];
 /** Radio button IDs */
 const RADIO_IDS = ['radio_anthropic', 'radio_openai', 'radio_gemini'];
+const API_MODE_RADIO_IDS = ['radio_api_mode_auto', 'radio_api_mode_responses', 'radio_api_mode_chat'];
 export class ControlPanel {
     constructor(configManager) {
         this.agentManager = null;
@@ -145,20 +147,29 @@ export class ControlPanel {
                 logger.debug(`[ControlPanel] ${id} → ${!prev}`);
             });
         }
-        // 3 radio buttons
+        // Provider radios
         bind('radio_anthropic', () => this.setProviderRadio('anthropic'));
         bind('radio_openai', () => this.setProviderRadio('openai'));
         bind('radio_gemini', () => this.setProviderRadio('gemini'));
-        logger.info(`[ControlPanel] ${count}/18 events registered`);
+        // API mode radios
+        bind('radio_api_mode_auto', () => this.setAPIModeRadio('auto'));
+        bind('radio_api_mode_responses', () => this.setAPIModeRadio('responses'));
+        bind('radio_api_mode_chat', () => this.setAPIModeRadio('chat.completions'));
+        logger.info(`[ControlPanel] ${count} events registered`);
         return count;
     }
     // ==================================================
     // Helpers — use cached view references
     // ==================================================
     setProviderRadio(provider) {
-        this.checkboxStates.set('radio_anthropic', provider === 'anthropic');
-        this.checkboxStates.set('radio_openai', provider === 'openai');
-        this.checkboxStates.set('radio_gemini', provider === 'gemini');
+        this.setCheckboxState('radio_anthropic', provider === 'anthropic');
+        this.setCheckboxState('radio_openai', provider === 'openai');
+        this.setCheckboxState('radio_gemini', provider === 'gemini');
+    }
+    setAPIModeRadio(apiMode) {
+        this.setCheckboxState('radio_api_mode_auto', apiMode === 'auto');
+        this.setCheckboxState('radio_api_mode_responses', apiMode === 'responses');
+        this.setCheckboxState('radio_api_mode_chat', apiMode === 'chat.completions');
     }
     setCheckboxState(id, checked) {
         this.checkboxStates.set(id, checked);
@@ -241,6 +252,7 @@ export class ControlPanel {
             if (config.model.baseURL) {
                 this.writeText('edit_base_url', config.model.baseURL);
             }
+            this.setAPIModeRadio(config.model.apiMode || 'auto');
             this.writeText('edit_system_prompt', config.agent.defaultSystemPrompt);
             // Advanced
             this.writeText('edit_context_warning', config.agent.contextWindowWarning.toString());
@@ -314,6 +326,12 @@ export class ControlPanel {
                 config.model.temperature = parseFloat(temp);
             const baseUrl = this.readText('edit_base_url');
             config.model.baseURL = baseUrl?.trim() || undefined;
+            if (this.getCheckboxState('radio_api_mode_responses'))
+                config.model.apiMode = 'responses';
+            else if (this.getCheckboxState('radio_api_mode_chat'))
+                config.model.apiMode = 'chat.completions';
+            else
+                config.model.apiMode = 'auto';
             const prompt = this.readText('edit_system_prompt');
             if (prompt)
                 config.agent.defaultSystemPrompt = prompt;
@@ -706,6 +724,35 @@ export class ControlPanel {
         android:text="Base URL (可选，用于 DeepSeek/Kimi 等兼容平台)" android:textSize="12sp" android:textColor="#999999" android:layout_marginTop="16dp"/>
     <EditText android:id="@+id/edit_base_url" android:layout_width="match_parent" android:layout_height="wrap_content"
         android:hint="https://api.deepseek.com (可选)" android:inputType="textUri" android:padding="12dp" android:background="#F5F5F5" android:layout_marginTop="8dp"/>
+
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:text="OpenAI API Mode" android:textSize="12sp" android:textColor="#999999" android:layout_marginTop="16dp"/>
+    <RadioGroup
+        android:id="@+id/radio_api_mode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="8dp">
+
+        <RadioButton
+            android:id="@+id/radio_api_mode_auto"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Auto (recommended)"
+            android:checked="true"/>
+
+        <RadioButton
+            android:id="@+id/radio_api_mode_responses"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Force Responses API"/>
+
+        <RadioButton
+            android:id="@+id/radio_api_mode_chat"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Force Chat Completions"/>
+    </RadioGroup>
 </LinearLayout>
 
 <LinearLayout

@@ -75,8 +75,9 @@ export class ModelAPIError extends Error {
  * Supports Anthropic Claude, OpenAI, and Gemini (via OpenAI-compatible API)
  */
 export class ModelAPI {
-    constructor(provider, apiKey, baseURL) {
+    constructor(provider, apiKey, baseURL, openaiAPIMode = 'auto') {
         this.useNativeHttp = false; // Use native HTTP instead of SDK
+        this.useNativeGemini = false;
         // Temporary storage for stream final response
         this.streamFinalResponse = null;
         this.streamAccumulator = {
@@ -90,6 +91,7 @@ export class ModelAPI {
         this.provider = provider;
         this.configuredBaseURL = baseURL;
         this.apiKey = apiKey;
+        this.openaiAPIMode = openaiAPIMode;
         // Use native HTTP for custom baseURL to avoid SDK path issues
         if (provider === 'anthropic' && baseURL) {
             this.useNativeHttp = true;
@@ -122,14 +124,29 @@ export class ModelAPI {
                 apiKey,
                 baseURL: baseURL || 'https://api.openai.com/v1',
             });
-            logger.info('ModelAPI initialized with OpenAI provider', { baseURL: baseURL || 'default' });
+            logger.info('ModelAPI initialized with OpenAI provider', {
+                baseURL: baseURL || 'default',
+                apiMode: this.openaiAPIMode,
+            });
         }
         else if (provider === 'gemini') {
-            this.openai = new OpenAI({
-                apiKey,
-                baseURL: baseURL || 'https://generativelanguage.googleapis.com/v1beta/openai/',
-            });
-            logger.info('ModelAPI initialized with Gemini provider (OpenAI-compatible)', { baseURL });
+            const normalizedBaseURL = (baseURL || '').toLowerCase();
+            this.useNativeGemini = !normalizedBaseURL || !normalizedBaseURL.includes('/openai');
+            if (this.useNativeGemini) {
+                logger.info('ModelAPI initialized with Gemini provider (native API)', {
+                    baseURL: baseURL || 'https://generativelanguage.googleapis.com/v1beta',
+                });
+            }
+            else {
+                this.openai = new OpenAI({
+                    apiKey,
+                    baseURL: this.normalizeGeminiCompatibleBaseURL(),
+                });
+                logger.info('ModelAPI initialized with Gemini provider (OpenAI-compatible)', {
+                    baseURL: this.normalizeGeminiCompatibleBaseURL(),
+                    apiMode: this.openaiAPIMode,
+                });
+            }
         }
         else {
             throw new Error(`Unknown provider: ${provider}`);
@@ -148,6 +165,9 @@ export class ModelAPI {
                 return this.createAnthropicMessageNative(params);
             }
             return this.createAnthropicMessage(params);
+        }
+        else if (this.provider === 'gemini' && this.useNativeGemini) {
+            return this.createGeminiMessage(params);
         }
         else if (this.provider === 'openai' || this.provider === 'gemini') {
             return this.createOpenAIMessage(params);
@@ -169,6 +189,10 @@ export class ModelAPI {
             else {
                 yield* this.createAnthropicMessageStream(params, streamingHandler);
             }
+            return this.getStreamFinalResponse();
+        }
+        else if (this.provider === 'gemini' && this.useNativeGemini) {
+            yield* this.createGeminiMessageStream(params, streamingHandler);
             return this.getStreamFinalResponse();
         }
         else if (this.provider === 'openai' || this.provider === 'gemini') {
@@ -205,6 +229,39 @@ export class ModelAPI {
             stopReason: acc.stopReason,
         };
         return this.streamFinalResponse;
+    }
+    normalizeTextContent(content) {
+        if (typeof content === 'string') {
+            return content;
+        }
+        if (Array.isArray(content)) {
+            return content
+                .map((part) => this.normalizeTextContent(part))
+                .filter(Boolean)
+                .join('');
+        }
+        if (!content || typeof content !== 'object') {
+            return '';
+        }
+        if (typeof content.text === 'string') {
+            return content.text;
+        }
+        if (typeof content.output_text === 'string') {
+            return content.output_text;
+        }
+        if (typeof content.input_text === 'string') {
+            return content.input_text;
+        }
+        if (typeof content.refusal === 'string') {
+            return content.refusal;
+        }
+        if (Array.isArray(content.content)) {
+            return this.normalizeTextContent(content.content);
+        }
+        if (Array.isArray(content.summary)) {
+            return this.normalizeTextContent(content.summary);
+        }
+        return '';
     }
     /**
      * Create message using Anthropic API
@@ -270,7 +327,7 @@ export class ModelAPI {
      * Removes oldest messages first (index 0+), always keeping at least 2 messages.
      * Also drops base64 image data from stripped messages to save more space.
      */
-    trimMessagesToBodyLimit(messages, systemPrompt, tools, maxBytes = 5 * 1024 * 1024 // 5 MB — well under the 6 MB hard limit
+    trimMessagesToBodyLimit(messages, systemPrompt, tools, maxBytes = 5 * 1024 * 1024 // 5 MB �?well under the 6 MB hard limit
     ) {
         const estimate = () => JSON.stringify({ system: systemPrompt, messages, tools }).length;
         if (estimate() <= maxBytes)
@@ -322,7 +379,7 @@ export class ModelAPI {
                 result.push({ role: 'assistant', content });
             }
             else if (m.role === 'tool') {
-                // Tool result — Anthropic uses user role with tool_result content blocks
+                // Tool result �?Anthropic uses user role with tool_result content blocks
                 // Merge consecutive tool results into one user message
                 const lastMsg = result[result.length - 1];
                 const toolResultBlock = {
@@ -393,6 +450,306 @@ export class ModelAPI {
             input: block.input,
         }));
     }
+    normalizeGeminiBaseURL() {
+        const baseURL = (this.configuredBaseURL || 'https://generativelanguage.googleapis.com/v1beta')
+            .replace(/\/+$/, '');
+        if (baseURL.endsWith('/models')) {
+            return baseURL;
+        }
+        const modelsIndex = baseURL.indexOf('/models/');
+        if (modelsIndex >= 0) {
+            return `${baseURL.slice(0, modelsIndex)}/models`;
+        }
+        return `${baseURL}/models`;
+    }
+    normalizeGeminiCompatibleBaseURL() {
+        return (this.configuredBaseURL || 'https://generativelanguage.googleapis.com/v1beta/openai/')
+            .replace(/\/+$/, '');
+    }
+    normalizeGeminiModel(model) {
+        return model.startsWith('models/') ? model.slice('models/'.length) : model;
+    }
+    buildGeminiFunctionDeclarations(tools) {
+        return tools?.length
+            ? tools.map((tool) => ({
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.input_schema || tool.parameters || { type: 'object', properties: {} },
+            }))
+            : undefined;
+    }
+    async buildGeminiParts(content) {
+        if (typeof content === 'string') {
+            return content ? [{ text: content }] : [];
+        }
+        if (!Array.isArray(content)) {
+            return [{ text: JSON.stringify(content) }];
+        }
+        const parts = [];
+        for (const block of content) {
+            if (typeof block === 'string') {
+                parts.push({ text: block });
+                continue;
+            }
+            if (block.type === 'text' || block.type === 'input_text' || block.type === 'output_text') {
+                if (block.text) {
+                    parts.push({ text: block.text });
+                }
+                continue;
+            }
+            if (block.type === 'tool_use') {
+                parts.push({
+                    functionCall: {
+                        id: block.id,
+                        name: block.name,
+                        args: block.input || {},
+                    },
+                });
+                continue;
+            }
+            if (block.type === 'image') {
+                parts.push({ text: '[Image omitted: Gemini native format currently degrades image history to text]' });
+                continue;
+            }
+            if (block.type === 'file') {
+                const fname = block.source?.filename || block.source?.url || 'unknown';
+                parts.push({ text: `[File: ${fname}]` });
+                continue;
+            }
+            if (block.type === 'refusal' && block.refusal) {
+                parts.push({ text: block.refusal });
+                continue;
+            }
+            const normalized = this.normalizeTextContent(block);
+            if (normalized) {
+                parts.push({ text: normalized });
+            }
+        }
+        return parts;
+    }
+    buildGeminiToolResponsePayload(message) {
+        let parsed = message.content;
+        if (typeof message.content === 'string') {
+            try {
+                parsed = JSON.parse(message.content);
+            }
+            catch {
+                parsed = message.content;
+            }
+        }
+        if (message.metadata?.is_error) {
+            return { error: parsed };
+        }
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed;
+        }
+        return { result: parsed };
+    }
+    async convertMessagesToGeminiFormat(messages) {
+        const result = [];
+        for (const message of messages) {
+            if (message.role === 'system') {
+                continue;
+            }
+            if (message.role === 'tool') {
+                const part = {
+                    functionResponse: {
+                        id: message.metadata?.tool_call_id || undefined,
+                        name: message.metadata?.tool_name || 'tool',
+                        response: this.buildGeminiToolResponsePayload(message),
+                    },
+                };
+                const lastMessage = result[result.length - 1];
+                if (lastMessage?.role === 'user' && Array.isArray(lastMessage.parts) && lastMessage.parts.every((item) => item.functionResponse)) {
+                    lastMessage.parts.push(part);
+                }
+                else {
+                    result.push({ role: 'user', parts: [part] });
+                }
+                continue;
+            }
+            if (message.role === 'assistant') {
+                const providerContent = message.metadata?.providerContent;
+                if (providerContent?.parts && Array.isArray(providerContent.parts)) {
+                    result.push({
+                        role: providerContent.role || 'model',
+                        parts: providerContent.parts,
+                    });
+                    continue;
+                }
+            }
+            const parts = await this.buildGeminiParts(message.content);
+            if (message.role === 'assistant' && message.metadata?.toolCalls) {
+                for (const toolCall of message.metadata.toolCalls) {
+                    parts.push({
+                        functionCall: {
+                            id: toolCall.id,
+                            name: toolCall.name,
+                            args: toolCall.input || {},
+                        },
+                    });
+                }
+            }
+            result.push({
+                role: message.role === 'assistant' ? 'model' : 'user',
+                parts: parts.length > 0 ? parts : [{ text: '' }],
+            });
+        }
+        return result;
+    }
+    async buildGeminiRequestBody(params) {
+        const body = {
+            contents: await this.convertMessagesToGeminiFormat(params.messages),
+            generationConfig: {
+                temperature: params.temperature,
+                maxOutputTokens: params.maxTokens,
+            },
+        };
+        if (params.systemPrompt) {
+            body.system_instruction = {
+                parts: [{ text: params.systemPrompt }],
+            };
+        }
+        const functionDeclarations = this.buildGeminiFunctionDeclarations(params.tools);
+        if (functionDeclarations?.length) {
+            body.tools = [{ functionDeclarations }];
+        }
+        return body;
+    }
+    parseGeminiResponse(response) {
+        const candidate = response?.candidates?.[0] || {};
+        const content = candidate?.content || { role: 'model', parts: [] };
+        const parts = Array.isArray(content.parts) ? content.parts : [];
+        const reasoningContent = parts
+            .filter((part) => part?.thought && typeof part?.text === 'string')
+            .map((part) => part.text)
+            .join('');
+        const textContent = parts
+            .filter((part) => !part?.thought && typeof part?.text === 'string')
+            .map((part) => part.text)
+            .join('');
+        const toolCalls = parts
+            .filter((part) => part?.functionCall)
+            .map((part, index) => ({
+            id: part.functionCall.id || `gemini_call_${index + 1}`,
+            name: part.functionCall.name,
+            input: this.parseToolCallArguments(part.functionCall.args),
+        }));
+        return {
+            type: toolCalls.length > 0 ? 'tool_calls' : 'text',
+            content: textContent,
+            reasoningContent: reasoningContent || undefined,
+            providerContent: content,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            usage: {
+                inputTokens: response?.usageMetadata?.promptTokenCount || 0,
+                outputTokens: response?.usageMetadata?.candidatesTokenCount || 0,
+            },
+            stopReason: candidate?.finishReason || response?.promptFeedback?.blockReason,
+        };
+    }
+    async createGeminiMessage(params) {
+        try {
+            const modelName = this.normalizeGeminiModel(params.model);
+            const url = `${this.normalizeGeminiBaseURL()}/${modelName}:generateContent`;
+            const requestBody = await this.buildGeminiRequestBody(params);
+            logger.debug(`Sending native Gemini request (model: ${params.model})`);
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-goog-api-key': this.apiKey,
+                },
+                body: JSON.stringify(requestBody),
+            });
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new ModelAPIError(`HTTP ${response.status}: ${errorText}`, 'HTTP_ERROR', response.status);
+            }
+            const data = await response.json();
+            logger.info('Received response from Gemini native API', {
+                inputTokens: data?.usageMetadata?.promptTokenCount || 0,
+                outputTokens: data?.usageMetadata?.candidatesTokenCount || 0,
+                finishReason: data?.candidates?.[0]?.finishReason,
+            });
+            return this.parseGeminiResponse(data);
+        }
+        catch (error) {
+            throw this.handleGeminiError(error);
+        }
+    }
+    async *createGeminiMessageStream(params, streamingHandler) {
+        this.resetStreamAccumulator();
+        const messageId = `msg_${Date.now()}`;
+        const response = await this.createGeminiMessage(params);
+        this.streamFinalResponse = response;
+        this.streamAccumulator.content = response.content;
+        this.streamAccumulator.reasoningContent = response.reasoningContent || '';
+        this.streamAccumulator.toolCalls = response.toolCalls || [];
+        this.streamAccumulator.inputTokens = response.usage?.inputTokens || 0;
+        this.streamAccumulator.outputTokens = response.usage?.outputTokens || 0;
+        this.streamAccumulator.stopReason = response.stopReason;
+        streamingHandler?.emitMessageStart(messageId);
+        yield { type: 'message_start', messageId };
+        if (response.content) {
+            streamingHandler?.emitMessageUpdate(messageId, response.content, 'text_delta');
+            yield { type: 'text_delta', delta: response.content };
+        }
+        if (response.reasoningContent) {
+            streamingHandler?.emitMessageUpdate(messageId, response.reasoningContent, 'thinking_delta');
+            yield { type: 'thinking_delta', delta: response.reasoningContent };
+        }
+        for (const toolCall of response.toolCalls || []) {
+            streamingHandler?.emitToolStart(toolCall.id, toolCall.name, {});
+            yield { type: 'tool_use_start', toolCall: { id: toolCall.id, name: toolCall.name } };
+            const serializedInput = JSON.stringify(toolCall.input || {});
+            if (serializedInput && serializedInput !== '{}') {
+                yield {
+                    type: 'tool_use_delta',
+                    toolCall: { id: toolCall.id, name: toolCall.name },
+                    delta: serializedInput,
+                };
+            }
+            yield { type: 'tool_use_end', toolCall: { id: toolCall.id, name: toolCall.name } };
+        }
+        yield {
+            type: 'usage',
+            usage: {
+                inputTokens: response.usage?.inputTokens || 0,
+                outputTokens: response.usage?.outputTokens || 0,
+            },
+        };
+        streamingHandler?.emitMessageEnd(messageId, response.content, response.stopReason || 'stop', {
+            inputTokens: response.usage?.inputTokens || 0,
+            outputTokens: response.usage?.outputTokens || 0,
+        });
+        yield {
+            type: 'message_end',
+            stopReason: response.stopReason,
+            usage: {
+                inputTokens: response.usage?.inputTokens || 0,
+                outputTokens: response.usage?.outputTokens || 0,
+            },
+            providerContent: response.providerContent,
+        };
+    }
+    handleGeminiError(error) {
+        if (error instanceof ModelAPIError) {
+            return error;
+        }
+        const statusCode = error?.status || error?.statusCode;
+        const message = error?.message || error?.error?.message || 'Gemini API request failed';
+        if (statusCode === 429) {
+            return new ModelAPIError('Gemini rate limit exceeded. Please try again later.', 'RATE_LIMIT', 429);
+        }
+        if (statusCode === 401 || statusCode === 403) {
+            return new ModelAPIError('Gemini authentication failed. Please check your API key.', 'AUTH_ERROR', statusCode);
+        }
+        if (statusCode === 400) {
+            return new ModelAPIError(`Invalid Gemini request: ${message}`, 'INVALID_REQUEST', 400);
+        }
+        return new ModelAPIError(message, statusCode ? 'API_ERROR' : 'NETWORK_ERROR', statusCode);
+    }
     /**
      * Create message using OpenAI API (also works for Gemini via OpenAI-compatible API)
      */
@@ -402,34 +759,103 @@ export class ModelAPI {
         }
         try {
             logger.debug(`Sending request to ${this.provider} (model: ${params.model})`);
-            // Convert messages to OpenAI format
-            const messages = this.convertMessagesToOpenAIFormat(params.messages, params.systemPrompt);
-            // Convert tools to OpenAI function calling format
-            const toolsParam = params.tools?.length
-                ? params.tools.map((t) => ({
-                    type: 'function',
-                    function: {
-                        name: t.name,
-                        description: t.description,
-                        parameters: t.input_schema || t.parameters || {},
-                    },
-                }))
-                : undefined;
-            // Make API request
-            const response = await this.openai.chat.completions.create({
-                model: params.model,
-                messages: messages,
-                max_tokens: params.maxTokens,
-                temperature: params.temperature,
-                tools: toolsParam,
-            });
-            logger.info(`Received response from ${this.provider} (tokens: ${response.usage?.prompt_tokens}/${response.usage?.completion_tokens})`);
-            // Parse and return response
-            return this.parseOpenAIResponse(response);
+            if (this.openaiAPIMode === 'responses') {
+                return await this.createOpenAIResponseAPINonStream(params);
+            }
+            if (this.openaiAPIMode === 'chat.completions') {
+                return await this.createOpenAIChatCompletionMessage(params);
+            }
+            if (this.shouldPreferOpenAIResponsesAPI(params.model)) {
+                try {
+                    return await this.createOpenAIResponseAPINonStream(params);
+                }
+                catch (error) {
+                    if (!this.shouldFallbackOpenAIEndpoint(error)) {
+                        throw error;
+                    }
+                    logger.warn('[ModelAPI] Responses API unavailable, falling back to chat.completions', {
+                        provider: this.provider,
+                        model: params.model,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
+                    return await this.createOpenAIChatCompletionMessage(params);
+                }
+            }
+            try {
+                return await this.createOpenAIChatCompletionMessage(params);
+            }
+            catch (error) {
+                if (!this.shouldFallbackOpenAIEndpoint(error)) {
+                    throw error;
+                }
+                logger.warn('[ModelAPI] chat.completions unavailable, falling back to Responses API', {
+                    provider: this.provider,
+                    model: params.model,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                return await this.createOpenAIResponseAPINonStream(params);
+            }
         }
         catch (error) {
             throw this.handleOpenAIError(error);
         }
+    }
+    async createOpenAIChatCompletionMessage(params) {
+        if (!this.openai) {
+            throw new Error('OpenAI client not initialized');
+        }
+        const messages = this.convertMessagesToOpenAIFormat(params.messages, params.systemPrompt);
+        const toolsParam = this.buildOpenAIChatTools(params.tools);
+        const response = await this.openai.chat.completions.create({
+            model: params.model,
+            messages: messages,
+            max_tokens: params.maxTokens,
+            temperature: params.temperature,
+            tools: toolsParam,
+        });
+        logger.info(`Received chat.completions response from ${this.provider} (tokens: ${response.usage?.prompt_tokens}/${response.usage?.completion_tokens})`);
+        return this.parseOpenAIResponse(response);
+    }
+    async createOpenAIResponseAPINonStream(params) {
+        if (!this.openai) {
+            throw new Error('OpenAI client not initialized');
+        }
+        const responseInput = this.convertMessagesToOpenAIResponseInput(params.messages);
+        const toolsParam = this.buildOpenAIResponsesTools(params.tools);
+        const response = await this.openai.responses.create({
+            model: params.model,
+            input: responseInput,
+            instructions: params.systemPrompt || undefined,
+            max_output_tokens: params.maxTokens,
+            temperature: params.temperature,
+            tools: toolsParam,
+            parallel_tool_calls: toolsParam?.length ? true : undefined,
+        });
+        logger.info(`Received Responses API response from ${this.provider} (tokens: ${response.usage?.input_tokens}/${response.usage?.output_tokens})`);
+        return this.parseOpenAIResponsesAPIResponse(response);
+    }
+    buildOpenAIChatTools(tools) {
+        return tools?.length
+            ? tools.map((t) => ({
+                type: 'function',
+                function: {
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.input_schema || t.parameters || {},
+                },
+            }))
+            : undefined;
+    }
+    buildOpenAIResponsesTools(tools) {
+        return tools?.length
+            ? tools.map((t) => ({
+                type: 'function',
+                name: t.name,
+                description: t.description,
+                parameters: t.input_schema || t.parameters || {},
+                strict: false,
+            }))
+            : undefined;
     }
     /**
      * Convert internal message format to OpenAI format
@@ -491,15 +917,116 @@ export class ModelAPI {
         return result;
     }
     /**
-     * Parse OpenAI API response
+     * Convert internal message format to OpenAI Responses API input items.
+     * Keeps tool calls and tool results as explicit function_call items so
+     * response-only compatible backends can continue multi-turn tool loops.
      */
+    convertMessagesToOpenAIResponseInput(messages) {
+        const result = [];
+        const seenFunctionCallIds = new Set();
+        for (const m of messages) {
+            if (m.role === 'system')
+                continue;
+            if (m.role === 'assistant' && m.metadata?.toolCalls) {
+                if (typeof m.content === 'string' && m.content) {
+                    result.push({
+                        type: 'message',
+                        role: 'assistant',
+                        content: m.content,
+                    });
+                }
+                for (const tc of m.metadata.toolCalls) {
+                    if (!tc.id) {
+                        continue;
+                    }
+                    seenFunctionCallIds.add(tc.id);
+                    result.push({
+                        type: 'function_call',
+                        call_id: tc.id,
+                        name: tc.name,
+                        arguments: JSON.stringify(tc.input || {}),
+                    });
+                }
+                continue;
+            }
+            if (m.role === 'tool') {
+                const callId = m.metadata?.tool_call_id || '';
+                if (!callId || !seenFunctionCallIds.has(callId)) {
+                    logger.warn(`[ModelAPI] Skipping orphan function_call_output with unknown call_id=${callId || '(missing)'}`);
+                    continue;
+                }
+                result.push({
+                    type: 'function_call_output',
+                    call_id: callId,
+                    output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+                });
+                continue;
+            }
+            if (Array.isArray(m.content)) {
+                const messageContent = [];
+                const assistantToolCalls = [];
+                const toolOutputs = [];
+                for (const block of m.content) {
+                    if (block.type === 'tool_use' && m.role === 'assistant') {
+                        if (!block.id) {
+                            continue;
+                        }
+                        seenFunctionCallIds.add(block.id);
+                        assistantToolCalls.push({
+                            type: 'function_call',
+                            call_id: block.id,
+                            name: block.name,
+                            arguments: JSON.stringify(block.input || {}),
+                        });
+                        continue;
+                    }
+                    if (block.type === 'tool_result') {
+                        if (!block.tool_use_id || !seenFunctionCallIds.has(block.tool_use_id)) {
+                            logger.warn(`[ModelAPI] Skipping orphan tool_result block with unknown call_id=${block.tool_use_id || '(missing)'}`);
+                            continue;
+                        }
+                        toolOutputs.push({
+                            type: 'function_call_output',
+                            call_id: block.tool_use_id,
+                            output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+                        });
+                        continue;
+                    }
+                    const responseBlock = this.buildOpenAIResponseInputBlock(block);
+                    if (responseBlock) {
+                        messageContent.push(responseBlock);
+                    }
+                }
+                if (messageContent.length > 0) {
+                    result.push({
+                        type: 'message',
+                        role: m.role,
+                        content: messageContent,
+                    });
+                }
+                if (assistantToolCalls.length > 0) {
+                    result.push(...assistantToolCalls);
+                }
+                if (toolOutputs.length > 0) {
+                    result.push(...toolOutputs);
+                }
+                continue;
+            }
+            result.push({
+                type: 'message',
+                role: m.role,
+                content: this.buildOpenAIResponseInputContent(m.content),
+            });
+        }
+        return result;
+    }
     parseOpenAIResponse(response) {
         const choice = response.choices[0];
         const message = choice.message;
-        // Extract text content
-        const textContent = message.content || '';
+        // Some OpenAI-compatible backends return structured content arrays instead of a plain string.
+        const textContent = this.normalizeTextContent(message.content);
         // Extract reasoning_content (DeepSeek reasoner)
-        const reasoningContent = message.reasoning_content || undefined;
+        const reasoningContent = this.normalizeTextContent(message.reasoning_content) || undefined;
         // Check for tool calls
         if (message.tool_calls && message.tool_calls.length > 0) {
             logger.debug('Tool calls detected in response');
@@ -526,6 +1053,22 @@ export class ModelAPI {
             stopReason: choice.finish_reason,
         };
     }
+    parseOpenAIResponsesAPIResponse(response) {
+        const toolCalls = this.extractOpenAIResponseAPIToolCalls(response.output || []);
+        const reasoningContent = this.extractOpenAIResponsesReasoning(response.output || []);
+        const stopReason = this.normalizeOpenAIResponsesStopReason(response);
+        return {
+            type: toolCalls.length > 0 ? 'tool_calls' : 'text',
+            content: response.output_text || this.extractOpenAIResponsesText(response.output || []),
+            reasoningContent: reasoningContent || undefined,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            usage: {
+                inputTokens: response.usage?.input_tokens || 0,
+                outputTokens: response.usage?.output_tokens || 0,
+            },
+            stopReason,
+        };
+    }
     /**
      * Extract tool calls from OpenAI response (Phase 2)
      */
@@ -533,8 +1076,128 @@ export class ModelAPI {
         return toolCalls.map((call) => ({
             id: call.id,
             name: call.function.name,
-            input: JSON.parse(call.function.arguments),
+            input: this.parseToolCallArguments(call.function.arguments),
         }));
+    }
+    extractOpenAIResponseAPIToolCalls(output) {
+        return output
+            .filter((item) => item?.type === 'function_call')
+            .map((item) => ({
+            id: item.call_id || item.id,
+            name: item.name,
+            input: this.parseToolCallArguments(item.arguments),
+        }));
+    }
+    extractOpenAIResponsesText(output) {
+        return output
+            .filter((item) => item?.type === 'message')
+            .map((item) => this.normalizeTextContent(item.content || []))
+            .filter(Boolean)
+            .join('');
+    }
+    extractOpenAIResponsesReasoning(output) {
+        return output
+            .filter((item) => item?.type === 'reasoning')
+            .map((item) => this.normalizeTextContent(item.summary || item.content || []))
+            .filter(Boolean)
+            .join('');
+    }
+    normalizeOpenAIResponsesStopReason(response) {
+        const reason = response?.incomplete_details?.reason;
+        if (reason === 'max_output_tokens') {
+            return 'max_tokens';
+        }
+        if (reason) {
+            return reason;
+        }
+        return response?.status || undefined;
+    }
+    parseToolCallArguments(raw) {
+        if (!raw)
+            return {};
+        if (typeof raw === 'object')
+            return raw;
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            logger.warn('[ModelAPI] Failed to parse tool call arguments as JSON', { raw });
+            return {};
+        }
+    }
+    buildOpenAIResponseInputContent(content) {
+        if (typeof content === 'string')
+            return content;
+        if (!Array.isArray(content))
+            return JSON.stringify(content);
+        const blocks = content
+            .map((block) => this.buildOpenAIResponseInputBlock(block))
+            .filter(Boolean);
+        return blocks.length > 0 ? blocks : JSON.stringify(content);
+    }
+    buildOpenAIResponseInputBlock(block) {
+        if (!block)
+            return null;
+        if (typeof block === 'string') {
+            return { type: 'input_text', text: block };
+        }
+        if (block.type === 'text' || block.type === 'input_text' || block.type === 'output_text') {
+            return { type: 'input_text', text: block.text || '' };
+        }
+        if (block.type === 'refusal') {
+            return { type: 'input_text', text: block.refusal || '' };
+        }
+        if (block.type === 'image') {
+            if (block.source?.type === 'url') {
+                return {
+                    type: 'input_image',
+                    image_url: block.source.data,
+                    detail: 'auto',
+                };
+            }
+            if (block.source?.type === 'base64') {
+                const mediaType = block.source.media_type || 'image/jpeg';
+                return {
+                    type: 'input_image',
+                    image_url: `data:${mediaType};base64,${block.source.data}`,
+                    detail: 'auto',
+                };
+            }
+        }
+        if (block.type === 'file') {
+            const fname = block.source?.filename || block.source?.url || 'unknown';
+            return { type: 'input_text', text: `[File: ${fname}]` };
+        }
+        return null;
+    }
+    shouldPreferOpenAIResponsesAPI(model) {
+        if (this.provider !== 'openai') {
+            return false;
+        }
+        const baseURL = (this.configuredBaseURL || 'https://api.openai.com/v1').toLowerCase();
+        if (baseURL.includes('api.openai.com')) {
+            return true;
+        }
+        const lowerModel = model.toLowerCase();
+        return /^o[134]/.test(lowerModel) || lowerModel.startsWith('gpt-5');
+    }
+    shouldFallbackOpenAIEndpoint(error) {
+        const statusCode = error?.status || error?.statusCode;
+        const message = String(error?.message || '').toLowerCase();
+        if ([404, 405, 501].includes(statusCode)) {
+            return true;
+        }
+        if (statusCode === 400) {
+            return [
+                'not found',
+                'unknown url',
+                'invalid endpoint',
+                'unsupported',
+                'not supported',
+                'unsupported parameter',
+            ].some((keyword) => message.includes(keyword));
+        }
+        return false;
     }
     /**
      * Handle OpenAI API errors
@@ -674,7 +1337,7 @@ export class ModelAPI {
                 }
             }
             else if (block.type === 'file') {
-                // Anthropic doesn't support file uploads — degrade to text description
+                // Anthropic doesn't support file uploads �?degrade to text description
                 const fname = block.source?.filename || block.source?.url || 'unknown';
                 blocks.push({ type: 'text', text: `[File: ${fname}]` });
             }
@@ -694,15 +1357,18 @@ export class ModelAPI {
             return content;
         if (!Array.isArray(content))
             return JSON.stringify(content);
-        const hasMultimodal = content.some((b) => b.type === 'image' || b.type === 'file');
-        if (!hasMultimodal)
-            return JSON.stringify(content);
         const blocks = [];
+        let hasNonTextBlock = false;
         for (const block of content) {
-            if (block.type === 'text') {
-                blocks.push({ type: 'text', text: block.text });
+            if (typeof block === 'string') {
+                blocks.push({ type: 'text', text: block });
+                continue;
+            }
+            if (block.type === 'text' || block.type === 'input_text' || block.type === 'output_text') {
+                blocks.push({ type: 'text', text: block.text || '' });
             }
             else if (block.type === 'image') {
+                hasNonTextBlock = true;
                 if (block.source?.type === 'url') {
                     blocks.push({
                         type: 'image_url',
@@ -718,14 +1384,30 @@ export class ModelAPI {
                 }
             }
             else if (block.type === 'file') {
+                hasNonTextBlock = true;
                 const fname = block.source?.filename || block.source?.url || 'unknown';
                 blocks.push({ type: 'text', text: `[File: ${fname}]` });
             }
+            else if (block.type === 'refusal') {
+                blocks.push({ type: 'text', text: block.refusal || '' });
+            }
             else {
-                blocks.push(block);
+                const normalized = this.normalizeTextContent(block);
+                if (normalized) {
+                    blocks.push({ type: 'text', text: normalized });
+                }
+                else {
+                    blocks.push({ type: 'text', text: JSON.stringify(block) });
+                }
             }
         }
-        return blocks.length > 0 ? blocks : JSON.stringify(content);
+        if (!blocks.length) {
+            return JSON.stringify(content);
+        }
+        if (!hasNonTextBlock) {
+            return blocks.map((block) => block.text || '').join('');
+        }
+        return blocks;
     }
     /**
      * Download a remote image URL to base64.
@@ -947,146 +1629,312 @@ export class ModelAPI {
         if (!this.openai) {
             throw new Error('OpenAI client not initialized');
         }
-        this.resetStreamAccumulator();
-        const messageId = `msg_${Date.now()}`;
         try {
-            logger.debug(`Sending streaming request to ${this.provider} (model: ${params.model})`);
-            const messages = this.convertMessagesToOpenAIFormat(params.messages, params.systemPrompt);
-            const toolsParam = params.tools?.length
-                ? params.tools.map((t) => ({
-                    type: 'function',
-                    function: {
-                        name: t.name,
-                        description: t.description,
-                        parameters: t.input_schema || t.parameters || {},
-                    },
-                }))
-                : undefined;
-            // Create streaming request
-            const stream = await this.openai.chat.completions.create({
-                model: params.model,
-                messages: messages,
-                max_tokens: params.maxTokens,
-                temperature: params.temperature,
-                tools: toolsParam,
-                stream: true,
-                stream_options: { include_usage: true },
-            });
-            // Emit message start
-            streamingHandler?.emitMessageStart(messageId);
-            yield { type: 'message_start', messageId };
-            // Track tool calls being built
-            const toolCallBuilders = new Map();
-            for await (const chunk of stream) {
-                const choice = chunk.choices?.[0];
-                const delta = choice?.delta;
-                if (delta?.content) {
-                    const text = delta.content;
-                    this.streamAccumulator.content += text;
-                    streamingHandler?.emitMessageUpdate(messageId, text, 'text_delta');
-                    yield { type: 'text_delta', delta: text };
+            if (this.openaiAPIMode === 'responses') {
+                yield* this.createOpenAIResponsesMessageStream(params, streamingHandler);
+                return;
+            }
+            if (this.openaiAPIMode === 'chat.completions') {
+                yield* this.createOpenAIChatCompletionMessageStream(params, streamingHandler);
+                return;
+            }
+            if (this.shouldPreferOpenAIResponsesAPI(params.model)) {
+                try {
+                    yield* this.createOpenAIResponsesMessageStream(params, streamingHandler);
+                    return;
                 }
-                // Handle reasoning_content for DeepSeek
-                if (delta?.reasoning_content) {
-                    const reasoning = delta.reasoning_content;
-                    this.streamAccumulator.reasoningContent += reasoning;
-                    streamingHandler?.emitMessageUpdate(messageId, reasoning, 'thinking_delta');
-                    yield { type: 'thinking_delta', delta: reasoning };
-                }
-                // Handle tool calls
-                if (delta?.tool_calls) {
-                    for (const toolCall of delta.tool_calls) {
-                        const index = toolCall.index;
-                        if (!toolCallBuilders.has(index)) {
-                            // New tool call
-                            toolCallBuilders.set(index, {
-                                id: toolCall.id || '',
-                                name: toolCall.function?.name || '',
-                                arguments: '',
-                            });
-                            if (toolCall.id && toolCall.function?.name) {
-                                streamingHandler?.emitToolStart(toolCall.id, toolCall.function.name, {});
-                                yield {
-                                    type: 'tool_use_start',
-                                    toolCall: { id: toolCall.id, name: toolCall.function.name },
-                                };
-                            }
-                        }
-                        const builder = toolCallBuilders.get(index);
-                        // Update ID if provided
-                        if (toolCall.id) {
-                            builder.id = toolCall.id;
-                        }
-                        // Update name if provided
-                        if (toolCall.function?.name) {
-                            builder.name = toolCall.function.name;
-                        }
-                        // Append arguments delta
-                        if (toolCall.function?.arguments) {
-                            builder.arguments += toolCall.function.arguments;
-                            yield {
-                                type: 'tool_use_delta',
-                                toolCall: { id: builder.id },
-                                delta: toolCall.function.arguments,
-                            };
-                        }
+                catch (error) {
+                    if (!this.shouldFallbackOpenAIEndpoint(error)) {
+                        throw error;
                     }
-                }
-                // Handle finish reason
-                if (choice?.finish_reason) {
-                    this.streamAccumulator.stopReason = choice.finish_reason;
-                    // Finalize tool calls
-                    for (const builder of toolCallBuilders.values()) {
-                        try {
-                            const input = builder.arguments ? JSON.parse(builder.arguments) : {};
-                            this.streamAccumulator.toolCalls.push({
-                                id: builder.id,
-                                name: builder.name,
-                                input,
-                            });
-                            yield { type: 'tool_use_end', toolCall: { id: builder.id, name: builder.name } };
-                        }
-                        catch {
-                            this.streamAccumulator.toolCalls.push({
-                                id: builder.id,
-                                name: builder.name,
-                                input: {},
-                            });
-                        }
-                    }
-                }
-                // Handle usage in stream (with stream_options.include_usage)
-                if (chunk.usage) {
-                    this.streamAccumulator.inputTokens = chunk.usage.prompt_tokens || 0;
-                    this.streamAccumulator.outputTokens = chunk.usage.completion_tokens || 0;
-                    yield {
-                        type: 'usage',
-                        usage: {
-                            inputTokens: chunk.usage.prompt_tokens,
-                            outputTokens: chunk.usage.completion_tokens,
-                        },
-                    };
+                    logger.warn('[ModelAPI] Responses API stream unavailable, falling back to chat.completions stream', {
+                        provider: this.provider,
+                        model: params.model,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
+                    yield* this.createOpenAIChatCompletionMessageStream(params, streamingHandler);
+                    return;
                 }
             }
-            // Emit message end
-            streamingHandler?.emitMessageEnd(messageId, this.streamAccumulator.content, this.streamAccumulator.stopReason || 'end_turn', {
-                inputTokens: this.streamAccumulator.inputTokens,
-                outputTokens: this.streamAccumulator.outputTokens,
-            });
-            yield {
-                type: 'message_end',
-                stopReason: this.streamAccumulator.stopReason,
-                usage: {
-                    inputTokens: this.streamAccumulator.inputTokens,
-                    outputTokens: this.streamAccumulator.outputTokens,
-                },
-            };
-            logger.info(`Streaming completed (tokens: ${this.streamAccumulator.inputTokens}/${this.streamAccumulator.outputTokens})`);
+            try {
+                yield* this.createOpenAIChatCompletionMessageStream(params, streamingHandler);
+            }
+            catch (error) {
+                if (!this.shouldFallbackOpenAIEndpoint(error)) {
+                    throw error;
+                }
+                logger.warn('[ModelAPI] chat.completions stream unavailable, falling back to Responses API stream', {
+                    provider: this.provider,
+                    model: params.model,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                yield* this.createOpenAIResponsesMessageStream(params, streamingHandler);
+            }
         }
         catch (error) {
             streamingHandler?.emitError('STREAM_ERROR', error instanceof Error ? error.message : 'Unknown streaming error');
             throw this.handleOpenAIError(error);
         }
+    }
+    async *createOpenAIChatCompletionMessageStream(params, streamingHandler) {
+        if (!this.openai) {
+            throw new Error('OpenAI client not initialized');
+        }
+        this.resetStreamAccumulator();
+        const messageId = `msg_${Date.now()}`;
+        logger.debug(`Sending chat.completions stream to ${this.provider} (model: ${params.model})`);
+        const messages = this.convertMessagesToOpenAIFormat(params.messages, params.systemPrompt);
+        const toolsParam = this.buildOpenAIChatTools(params.tools);
+        const stream = await this.openai.chat.completions.create({
+            model: params.model,
+            messages: messages,
+            max_tokens: params.maxTokens,
+            temperature: params.temperature,
+            tools: toolsParam,
+            stream: true,
+            stream_options: { include_usage: true },
+        });
+        streamingHandler?.emitMessageStart(messageId);
+        yield { type: 'message_start', messageId };
+        const toolCallBuilders = new Map();
+        for await (const chunk of stream) {
+            const choice = chunk.choices?.[0];
+            const delta = choice?.delta;
+            if (delta?.content) {
+                const text = delta.content;
+                this.streamAccumulator.content += text;
+                streamingHandler?.emitMessageUpdate(messageId, text, 'text_delta');
+                yield { type: 'text_delta', delta: text };
+            }
+            if (delta?.reasoning_content) {
+                const reasoning = delta.reasoning_content;
+                this.streamAccumulator.reasoningContent += reasoning;
+                streamingHandler?.emitMessageUpdate(messageId, reasoning, 'thinking_delta');
+                yield { type: 'thinking_delta', delta: reasoning };
+            }
+            if (delta?.tool_calls) {
+                for (const toolCall of delta.tool_calls) {
+                    const index = toolCall.index;
+                    if (!toolCallBuilders.has(index)) {
+                        toolCallBuilders.set(index, {
+                            id: toolCall.id || '',
+                            name: toolCall.function?.name || '',
+                            arguments: '',
+                        });
+                        if (toolCall.id && toolCall.function?.name) {
+                            streamingHandler?.emitToolStart(toolCall.id, toolCall.function.name, {});
+                            yield {
+                                type: 'tool_use_start',
+                                toolCall: { id: toolCall.id, name: toolCall.function.name },
+                            };
+                        }
+                    }
+                    const builder = toolCallBuilders.get(index);
+                    if (toolCall.id) {
+                        builder.id = toolCall.id;
+                    }
+                    if (toolCall.function?.name) {
+                        builder.name = toolCall.function.name;
+                    }
+                    if (toolCall.function?.arguments) {
+                        builder.arguments += toolCall.function.arguments;
+                        yield {
+                            type: 'tool_use_delta',
+                            toolCall: { id: builder.id },
+                            delta: toolCall.function.arguments,
+                        };
+                    }
+                }
+            }
+            if (choice?.finish_reason) {
+                this.streamAccumulator.stopReason = choice.finish_reason;
+                for (const builder of toolCallBuilders.values()) {
+                    this.streamAccumulator.toolCalls.push({
+                        id: builder.id,
+                        name: builder.name,
+                        input: this.parseToolCallArguments(builder.arguments),
+                    });
+                    yield { type: 'tool_use_end', toolCall: { id: builder.id, name: builder.name } };
+                }
+            }
+            if (chunk.usage) {
+                this.streamAccumulator.inputTokens = chunk.usage.prompt_tokens || 0;
+                this.streamAccumulator.outputTokens = chunk.usage.completion_tokens || 0;
+                yield {
+                    type: 'usage',
+                    usage: {
+                        inputTokens: chunk.usage.prompt_tokens,
+                        outputTokens: chunk.usage.completion_tokens,
+                    },
+                };
+            }
+        }
+        streamingHandler?.emitMessageEnd(messageId, this.streamAccumulator.content, this.streamAccumulator.stopReason || 'end_turn', {
+            inputTokens: this.streamAccumulator.inputTokens,
+            outputTokens: this.streamAccumulator.outputTokens,
+        });
+        yield {
+            type: 'message_end',
+            stopReason: this.streamAccumulator.stopReason,
+            usage: {
+                inputTokens: this.streamAccumulator.inputTokens,
+                outputTokens: this.streamAccumulator.outputTokens,
+            },
+        };
+        logger.info(`Chat completion stream completed (tokens: ${this.streamAccumulator.inputTokens}/${this.streamAccumulator.outputTokens})`);
+    }
+    async *createOpenAIResponsesMessageStream(params, streamingHandler) {
+        if (!this.openai) {
+            throw new Error('OpenAI client not initialized');
+        }
+        this.resetStreamAccumulator();
+        const messageId = `msg_${Date.now()}`;
+        logger.debug(`Sending Responses API stream to ${this.provider} (model: ${params.model})`);
+        const responseInput = this.convertMessagesToOpenAIResponseInput(params.messages);
+        const toolsParam = this.buildOpenAIResponsesTools(params.tools);
+        const stream = await this.openai.responses.create({
+            model: params.model,
+            input: responseInput,
+            instructions: params.systemPrompt || undefined,
+            max_output_tokens: params.maxTokens,
+            temperature: params.temperature,
+            tools: toolsParam,
+            parallel_tool_calls: toolsParam?.length ? true : undefined,
+            stream: true,
+        });
+        streamingHandler?.emitMessageStart(messageId);
+        yield { type: 'message_start', messageId };
+        const toolCallBuilders = new Map();
+        const finalizeToolCall = async function* (self, builderKey) {
+            const builder = toolCallBuilders.get(builderKey);
+            if (!builder || builder.finalized) {
+                return;
+            }
+            builder.finalized = true;
+            self.streamAccumulator.toolCalls.push({
+                id: builder.id,
+                name: builder.name,
+                input: self.parseToolCallArguments(builder.arguments),
+            });
+            yield { type: 'tool_use_end', toolCall: { id: builder.id, name: builder.name } };
+        };
+        for await (const event of stream) {
+            switch (event.type) {
+                case 'response.output_text.delta': {
+                    this.streamAccumulator.content += event.delta;
+                    streamingHandler?.emitMessageUpdate(messageId, event.delta, 'text_delta');
+                    yield { type: 'text_delta', delta: event.delta };
+                    break;
+                }
+                case 'response.reasoning.delta':
+                case 'response.reasoning_summary.delta':
+                case 'response.reasoning_summary_text.delta': {
+                    this.streamAccumulator.reasoningContent += event.delta;
+                    streamingHandler?.emitMessageUpdate(messageId, event.delta, 'thinking_delta');
+                    yield { type: 'thinking_delta', delta: event.delta };
+                    break;
+                }
+                case 'response.output_item.added': {
+                    if (event.item?.type !== 'function_call') {
+                        break;
+                    }
+                    const builderKey = event.item.id || event.item.call_id || String(event.output_index);
+                    if (!toolCallBuilders.has(builderKey)) {
+                        toolCallBuilders.set(builderKey, {
+                            id: event.item.call_id || event.item.id,
+                            name: event.item.name || '',
+                            arguments: event.item.arguments || '',
+                            finalized: false,
+                        });
+                        if (event.item.call_id && event.item.name) {
+                            streamingHandler?.emitToolStart(event.item.call_id, event.item.name, {});
+                            yield {
+                                type: 'tool_use_start',
+                                toolCall: { id: event.item.call_id, name: event.item.name },
+                            };
+                        }
+                    }
+                    break;
+                }
+                case 'response.function_call_arguments.delta': {
+                    const builder = toolCallBuilders.get(event.item_id);
+                    if (builder) {
+                        builder.arguments += event.delta;
+                        yield {
+                            type: 'tool_use_delta',
+                            toolCall: { id: builder.id, name: builder.name },
+                            delta: event.delta,
+                        };
+                    }
+                    break;
+                }
+                case 'response.function_call_arguments.done': {
+                    const builder = toolCallBuilders.get(event.item_id);
+                    if (builder) {
+                        builder.arguments = event.arguments || builder.arguments;
+                    }
+                    break;
+                }
+                case 'response.output_item.done': {
+                    if (event.item?.type === 'function_call') {
+                        const builderKey = event.item.id || event.item.call_id || String(event.output_index);
+                        const builder = toolCallBuilders.get(builderKey);
+                        if (builder) {
+                            builder.id = event.item.call_id || builder.id;
+                            builder.name = event.item.name || builder.name;
+                            builder.arguments = event.item.arguments || builder.arguments;
+                        }
+                        else {
+                            toolCallBuilders.set(builderKey, {
+                                id: event.item.call_id || event.item.id,
+                                name: event.item.name || '',
+                                arguments: event.item.arguments || '',
+                                finalized: false,
+                            });
+                        }
+                        yield* finalizeToolCall(this, builderKey);
+                    }
+                    break;
+                }
+                case 'response.completed': {
+                    this.streamAccumulator.stopReason = this.normalizeOpenAIResponsesStopReason(event.response);
+                    this.streamAccumulator.content =
+                        event.response.output_text || this.streamAccumulator.content;
+                    const reasoningText = this.extractOpenAIResponsesReasoning(event.response.output || []);
+                    if (reasoningText && !this.streamAccumulator.reasoningContent) {
+                        this.streamAccumulator.reasoningContent = reasoningText;
+                    }
+                    this.streamAccumulator.inputTokens = event.response.usage?.input_tokens || 0;
+                    this.streamAccumulator.outputTokens = event.response.usage?.output_tokens || 0;
+                    for (const builderKey of toolCallBuilders.keys()) {
+                        yield* finalizeToolCall(this, builderKey);
+                    }
+                    yield {
+                        type: 'usage',
+                        usage: {
+                            inputTokens: this.streamAccumulator.inputTokens,
+                            outputTokens: this.streamAccumulator.outputTokens,
+                        },
+                    };
+                    break;
+                }
+                case 'error':
+                    throw new Error(event.message || 'Unknown Responses API stream error');
+            }
+        }
+        streamingHandler?.emitMessageEnd(messageId, this.streamAccumulator.content, this.streamAccumulator.stopReason || 'end_turn', {
+            inputTokens: this.streamAccumulator.inputTokens,
+            outputTokens: this.streamAccumulator.outputTokens,
+        });
+        yield {
+            type: 'message_end',
+            stopReason: this.streamAccumulator.stopReason,
+            usage: {
+                inputTokens: this.streamAccumulator.inputTokens,
+                outputTokens: this.streamAccumulator.outputTokens,
+            },
+        };
+        logger.info(`Responses API stream completed (tokens: ${this.streamAccumulator.inputTokens}/${this.streamAccumulator.outputTokens})`);
     }
     // ===== Native HTTP Implementation (bypassing SDK) =====
     /**

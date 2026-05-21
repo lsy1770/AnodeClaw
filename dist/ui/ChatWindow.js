@@ -26,6 +26,9 @@ export class ChatWindow {
         this.streamingAccum = '';
         this.streamingLastUpdate = 0;
         this.STREAM_THROTTLE_MS = 120;
+        this.activeStreamRunId = null;
+        this.thinkingAccum = '';
+        this.thinkingViewId = null;
         this.agentManager = agentManager;
         this.config = config;
         this.toolBeforeHandler = (data) => this.onToolBefore(data);
@@ -47,6 +50,7 @@ export class ChatWindow {
         floatingWindow.setTouchable(true);
         this.setupEventListeners();
         this.subscribeToEventBus();
+        this.subscribeToStreaming();
         floatingWindow.show();
         this.isVisible = true;
         await this.initializeSession();
@@ -64,6 +68,7 @@ export class ChatWindow {
         if (!this.isVisible)
             return;
         this.unsubscribeFromEventBus();
+        this.unsubscribeFromStreaming();
         floatingWindow.close();
         this.isVisible = false;
         logger.info('[ChatWindow] Closed');
@@ -90,6 +95,75 @@ export class ChatWindow {
         bus.off('tool:after', this.toolAfterHandler);
         bus.off('tool:error', this.toolErrorHandler);
         bus.off('message:assistant', this.messageAssistantHandler);
+    }
+    subscribeToStreaming() {
+        if (this.streamSubscription) {
+            return;
+        }
+        this.streamSubscription = this.agentManager
+            .getStreamingHandler()
+            .subscribe((event) => this.onStreamEvent(event));
+    }
+    unsubscribeFromStreaming() {
+        this.streamSubscription?.unsubscribe();
+        this.streamSubscription = undefined;
+        this.activeStreamRunId = null;
+    }
+    onStreamEvent(event) {
+        if (!this.isVisible)
+            return;
+        if (event.type === 'agent_start') {
+            this.activeStreamRunId = event.runId || null;
+            if (!this.isProcessing) {
+                this.streamingAccum = '';
+                this.streamingLastUpdate = 0;
+                this.thinkingAccum = '';
+                this.updateStreamingOutput('', true);
+                this.updateThinkingOutput('', true);
+                this.setStatus('Background running...', true);
+            }
+            return;
+        }
+        if (this.activeStreamRunId &&
+            event.runId &&
+            event.runId !== this.activeStreamRunId) {
+            return;
+        }
+        if (event.type === 'message_update') {
+            if (event.updateType === 'thinking_delta') {
+                this.thinkingAccum += event.delta || '';
+                this.updateThinkingOutput(this.thinkingAccum, false);
+                return;
+            }
+            if (!this.isProcessing && event.updateType === 'text_delta') {
+                this.streamingAccum += event.delta || '';
+                this.updateStreamingOutput(this.streamingAccum, false);
+            }
+            return;
+        }
+        if (event.type === 'message_end') {
+            this.updateThinkingOutput(this.thinkingAccum, true);
+            if (!this.isProcessing) {
+                this.updateStreamingOutput(this.streamingAccum, true);
+            }
+            return;
+        }
+        if (event.type === 'error') {
+            const errMsg = String(event.message || 'Unknown streaming error').substring(0, 120);
+            this.addLogLine(`✘ ${errMsg}`, '#EF9A9A');
+            if (!this.isProcessing) {
+                this.setStatus('Background error', false);
+            }
+            return;
+        }
+        if (event.type === 'agent_end') {
+            if (!this.isProcessing) {
+                this.updateStreamingOutput(this.streamingAccum, true);
+                this.updateThinkingOutput(this.thinkingAccum, true);
+                this.setStatus('Background complete', false);
+            }
+            this.activeStreamRunId = null;
+        }
     }
     onToolBefore(data) {
         if (!this.isVisible)
@@ -625,6 +699,40 @@ export class ChatWindow {
         }
         catch (_) { }
     }
+    updateThinkingOutput(accumulated, done) {
+        try {
+            const thinkingViewId = this.ensureThinkingView();
+            const thinkingView = floatingWindow.findView(thinkingViewId);
+            if (!thinkingView)
+                return;
+            const displayText = accumulated.length > 1600 ? `...${accumulated.slice(-1600)}` : accumulated;
+            const content = displayText
+                ? `Thinking:\n${displayText}${done ? '' : ' ...'}`
+                : '';
+            floatingWindow.setText(thinkingView, content);
+            this.scrollViewToBottom('scroll_log');
+        }
+        catch (_) { }
+    }
+    ensureThinkingView() {
+        if (this.thinkingViewId) {
+            return this.thinkingViewId;
+        }
+        const viewId = generateViewId();
+        floatingWindow.addViewToParent('log_container', `<TextView
+          android:id="@+id/${viewId}"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:text=""
+          android:textSize="11sp"
+          android:textColor="#CE93D8"
+          android:paddingTop="4dp"
+          android:paddingBottom="6dp"
+          android:fontFamily="monospace"
+          android:lineSpacingMultiplier="1.25"/>`);
+        this.thinkingViewId = viewId;
+        return viewId;
+    }
     scrollViewToBottom(scrollViewId) {
         try {
             const sv = floatingWindow.findView(scrollViewId);
@@ -654,6 +762,7 @@ export class ChatWindow {
             this.iterationCount = 0;
             this.streamingAccum = '';
             this.streamingLastUpdate = 0;
+            this.thinkingAccum = '';
             // Clear output area
             try {
                 const outputView = floatingWindow.findView('output_text');
@@ -661,6 +770,7 @@ export class ChatWindow {
                     floatingWindow.setText(outputView, '');
             }
             catch (_) { }
+            this.updateThinkingOutput('', true);
             this.addLogLine(`▶ ${message.substring(0, 100)}`, '#AAAAAA');
             this.setStatus('思考中...', true);
             this.updateIterationView();
@@ -668,11 +778,17 @@ export class ChatWindow {
                 this.updateStreamingOutput(accumulated, done);
             };
             try {
-                await this.agentManager.sendMessageWithStreaming(this.currentSessionId, message, onStream);
+                const response = await this.agentManager.sendMessageWithStreaming(this.currentSessionId, message, onStream, undefined, { allowBackgroundContinuation: true });
                 // Ensure final text is shown without cursor
                 this.updateStreamingOutput(this.streamingAccum, true);
-                this.setStatus('完成', false);
-                this.addLogLine('✔ 任务完成', '#81C784');
+                if (response.backgroundContinues) {
+                    this.setStatus('Background running...', false);
+                    this.addLogLine('-> Background continued', '#80CBC4');
+                }
+                else {
+                    this.setStatus('Complete', false);
+                    this.addLogLine('Task complete', '#81C784');
+                }
             }
             catch (error) {
                 const errMsg = (error.message || String(error)).substring(0, 120);
@@ -718,6 +834,8 @@ export class ChatWindow {
             const session = await this.agentManager.createSession({});
             this.currentSessionId = session.sessionId;
             this.iterationCount = 0;
+            this.streamingAccum = '';
+            this.thinkingAccum = '';
             this.clearLog();
             try {
                 const outputView = floatingWindow.findView('output_text');
@@ -728,7 +846,8 @@ export class ChatWindow {
                     floatingWindow.setText(iterView, '');
             }
             catch (_) { }
-            this.setStatus('空闲', false);
+            this.updateThinkingOutput('', true);
+            this.setStatus('Idle', false);
             logger.info(`[ChatWindow] New session: ${session.sessionId}`);
         }
         catch (error) {

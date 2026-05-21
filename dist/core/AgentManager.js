@@ -20,8 +20,8 @@ import { ContextWindowGuard } from './context/ContextWindowGuard.js';
 import { setCompressionModelAPI } from './context/CompressionStrategy.js';
 import { ApprovalManager } from './safety/ApprovalManager.js';
 import { HeartbeatManager, createStatusCheckTask, createCleanupTask } from './heartbeat/index.js';
-import { SkillManager, builtinSkills } from '../skills/index.js';
-import { SkillRetrieval } from '../skills/retrieval/SkillRetrieval.js';
+// Skills system: Progressive Disclosure (Markdown-based, AI loads on-demand)
+import { SkillStore } from '../skills/index.js';
 import { PromptBuilder } from './prompts/PromptBuilder.js';
 import { SystemPromptBuilder } from './prompts/SystemPromptBuilder.js';
 import { MemoryStore } from './memory/MemoryStore.js';
@@ -51,15 +51,23 @@ import { EventBus } from './EventBus.js';
  */
 function sanitizeMessages(messages) {
     const result = [];
+    const knownToolCallIds = new Set();
     for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
+        if (msg.role === 'tool') {
+            const toolCallId = msg.metadata?.tool_call_id;
+            if (!toolCallId || !knownToolCallIds.has(toolCallId)) {
+                logger.warn(`[sanitizeMessages] Dropping orphan tool_result with unknown tool_call_id=${toolCallId || '(missing)'}`);
+                continue;
+            }
+        }
         result.push(msg);
         if (msg.role !== 'assistant')
             continue;
         // Collect tool call ids from this assistant message.
         // Two storage formats exist:
-        //   1. Anthropic format  — content blocks with { type: 'tool_use', id }
-        //   2. OpenAI/streaming  — metadata.toolCalls array with { id }
+        //   1. Anthropic format   - content blocks with { type: 'tool_use', id }
+        //   2. OpenAI/streaming   - metadata.toolCalls array with { id }
         const toolUseIds = [];
         if (Array.isArray(msg.content)) {
             for (const block of msg.content) {
@@ -78,6 +86,9 @@ function sanitizeMessages(messages) {
         }
         if (toolUseIds.length === 0)
             continue;
+        for (const id of toolUseIds) {
+            knownToolCallIds.add(id);
+        }
         // Check what tool ids are covered by subsequent messages.
         const coveredIds = new Set();
         // Anthropic format: next user message with tool_result content blocks
@@ -99,8 +110,8 @@ function sanitizeMessages(messages) {
         }
         // Insert synthetic role:'tool' messages for uncovered ids.
         // Using role:'tool' works for both converters:
-        //   - convertMessagesToAnthropicFormat → wraps in user message with tool_result block
-        //   - convertMessagesToOpenAIFormat    → keeps as { role:'tool', tool_call_id }
+        //   - convertMessagesToAnthropicFormat  -> wraps in user message with tool_result block
+        //   - convertMessagesToOpenAIFormat     -> keeps as { role:'tool', tool_call_id }
         const missing = toolUseIds.filter((id) => !coveredIds.has(id));
         if (missing.length > 0) {
             logger.warn(`[sanitizeMessages] Inserting ${missing.length} synthetic tool_result(s) for orphaned tool_use blocks`);
@@ -125,13 +136,75 @@ function sanitizeMessages(messages) {
  * The main interface for interacting with the AI agent
  */
 export class AgentManager {
+    buildSessionPath(sessionId) {
+        const filename = `${sessionId}.json`;
+        if (typeof file !== 'undefined' && typeof file.join === 'function') {
+            return file.join(this.config.storage.sessionDir, filename);
+        }
+        return `${this.config.storage.sessionDir}/${filename}`;
+    }
+    markUserActivity(sessionId) {
+        const now = Date.now();
+        this.sessionLastUserActivity.set(sessionId, now);
+        this.sessionLastActivity.set(sessionId, now);
+    }
+    markAssistantActivity(sessionId) {
+        this.sessionLastActivity.set(sessionId, Date.now());
+    }
+    shouldSkipBackgroundContinuation(sessionId, scheduledUserActivityAt) {
+        const latestUserActivityAt = this.sessionLastUserActivity.get(sessionId) || 0;
+        return latestUserActivityAt > scheduledUserActivityAt;
+    }
+    emitAssistantMessage(sessionId, content) {
+        this.eventBus.emit('message:assistant', {
+            sessionId,
+            content,
+        });
+    }
+    getMostRecentlyActiveSessionId() {
+        const activeSessions = this.getActiveSessions();
+        if (activeSessions.length === 0)
+            return null;
+        let targetId = activeSessions[activeSessions.length - 1];
+        let latest = this.sessionLastActivity.get(targetId) || 0;
+        for (const sessionId of activeSessions) {
+            const ts = this.sessionLastActivity.get(sessionId) || 0;
+            if (ts >= latest) {
+                latest = ts;
+                targetId = sessionId;
+            }
+        }
+        return targetId;
+    }
+    shouldSuppressProactiveDuringChat(sessionId) {
+        if (this.activeResponseSessions.size > 0) {
+            return true;
+        }
+        const now = Date.now();
+        if (sessionId) {
+            const ts = this.sessionLastUserActivity.get(sessionId) || 0;
+            if (ts > 0 && now - ts < this.PROACTIVE_CHAT_SUPPRESSION_MS) {
+                return true;
+            }
+        }
+        for (const ts of this.sessionLastUserActivity.values()) {
+            if (now - ts < this.PROACTIVE_CHAT_SUPPRESSION_MS) {
+                return true;
+            }
+        }
+        return false;
+    }
     constructor(config) {
-        /** Maps "platform:chatId" → sessionId for social message routing */
+        /** Maps "platform:chatId"  -> sessionId for social message routing */
         this.socialSessions = new Map();
+        this.activeResponseSessions = new Set();
+        this.sessionLastUserActivity = new Map();
+        this.sessionLastActivity = new Map();
+        this.PROACTIVE_CHAT_SUPPRESSION_MS = 2 * 60 * 1000;
         this.config = config;
         this.sessions = new Map();
         // Initialize ModelAPI
-        this.modelAPI = new ModelAPI(config.model.provider, config.model.apiKey, config.model.baseURL);
+        this.modelAPI = new ModelAPI(config.model.provider, config.model.apiKey, config.model.baseURL, config.model.apiMode);
         // Enable AI-powered context compression
         setCompressionModelAPI(this.modelAPI, config.agent.summaryModel);
         // Initialize Tool System
@@ -142,7 +215,7 @@ export class AgentManager {
         // Initialize Context Window Guard
         // Use agent.contextWindow (model's input capacity), NOT model.maxTokens (response output limit)
         let contextWindowTokens = config.agent.contextWindow || 200000;
-        // 🔑 Auto-detect model-specific token limit
+        // 馃攽 Auto-detect model-specific token limit
         const detectedLimit = detectModelTokenLimit(config.model.model);
         if (detectedLimit !== 128000) { // Only use detected limit if it's not the default
             logger.info(`[AgentManager] Detected model token limit: ${detectedLimit} (model: ${config.model.model})`);
@@ -174,26 +247,25 @@ export class AgentManager {
             approvalChatId: safetyConfig.approvalChatId,
             approvalPlatform: safetyConfig.approvalPlatform || 'telegram',
         });
+        // Initialize social adapter manager early so startup paths can safely
+        // register adapters and wire approval routing even before any platform
+        // finishes connecting.
+        this.socialManager = new SocialAdapterManager();
+        this.registerSocialAdapters();
         // Initialize Heartbeat Manager
         this.heartbeatManager = new HeartbeatManager({
             minInterval: 60_000,
             maxTasks: 50,
         });
-        // Initialize Skill Manager
-        this.skillManager = new SkillManager(this.toolRegistry, this.toolExecutor);
-        // Initialize Skill Retrieval System
-        this.skillRetrieval = new SkillRetrieval({
-            workspaceDir: process.cwd(),
-            config: this.config,
-        });
-        // Load skills in background
-        this.skillRetrieval.refresh().then(() => {
-            const skillsPrompt = this.skillRetrieval.buildSkillsPrompt();
-            if (skillsPrompt) {
-                this.promptBuilder.addSection('skills', skillsPrompt, 85);
-            }
-        }).catch(err => {
-            logger.error('[AgentManager] Skill retrieval failed:', err);
+        // Initialize Skills System (Progressive Disclosure)
+        const skillsConfig = {
+            enabled: this.config.skills?.enabled ?? true,
+            bundledDir: this.config.skills?.bundledDir ?? './assets/skills',
+            workspaceDir: this.config.skills?.workspaceDir ?? './skills',
+        };
+        this.skillStore = new SkillStore(skillsConfig);
+        this.skillStore.load().catch(err => {
+            logger.warn('[AgentManager] SkillStore load failed:', err);
         });
         // Initialize Identity/Prompt System
         this.promptBuilder = new PromptBuilder({
@@ -207,8 +279,6 @@ export class AgentManager {
         });
         // Register built-in tools
         this.registerBuiltinTools();
-        // Register built-in skills
-        this.registerBuiltinSkills();
         // Initialize prompt builder (async - load identity files)
         this.promptBuilder.initialize().catch(err => {
             logger.warn('[AgentManager] PromptBuilder initialization failed (identity files may not exist yet):', err);
@@ -255,19 +325,17 @@ If there's nothing noteworthy, respond with an empty string.`,
                 return null;
             }
         });
-        // Initialize Social Manager
-        this.socialManager = new SocialAdapterManager();
-        this.registerSocialAdapters();
         this.proactiveBehavior.on('suggestions', async (suggestions) => {
             for (const s of suggestions) {
                 logger.info(`[Proactive] [${s.priority}] ${s.title}: ${s.description.slice(0, 80)}`);
             }
-            // System notification for high-priority items only (batch into one)
-            const urgent = suggestions.filter(s => s.priority === 'high');
+            const urgent = suggestions.filter((s) => s.priority === 'high');
             if (urgent.length > 0 && typeof notification !== 'undefined') {
                 try {
-                    const title = urgent.length === 1 ? `🤖 ${urgent[0].title}` : `🤖 ${urgent.length} 条重要提醒`;
-                    const body = urgent.map(s => s.description).join('\n').slice(0, 200);
+                    const title = urgent.length === 1
+                        ? `[Proactive] ${urgent[0].title}`
+                        : `[Proactive] ${urgent.length} important reminders`;
+                    const body = urgent.map((s) => s.description).join('\n').slice(0, 200);
                     await notification.show(title, body);
                 }
                 catch (e) {
@@ -275,7 +343,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 }
             }
         });
-        // AI-synthesized proactive message → inject directly into active chat session
+        // AI-synthesized proactive message -> inject directly into active chat session
         this.proactiveBehavior.on('proactiveMessage', async (msg) => {
             await this.injectProactiveMessage(msg);
         });
@@ -328,11 +396,11 @@ If there's nothing noteworthy, respond with an empty string.`,
         this.registerDefaultToolHooks();
         // Register EventBus consumers
         this.registerEventBusConsumers();
-        // Initialize Social - (Already initialized above)
+        // Initialize Social
         this.initializeSocial();
         // Connect social adapter to approval manager for Telegram approval flow
         this.approvalManager.setSocialAdapter(this.socialManager);
-        logger.info('AgentManager initialized: tools, lanes, context, approval, heartbeat, skills, identity, social, memory, dailylog, semantic, proactive, plugins, subagents, snapshot');
+        logger.info('AgentManager initialized: tools, lanes, context, approval, heartbeat, identity, social, memory, dailylog, semantic, proactive, plugins, subagents, snapshot');
     }
     /**
      * Register all built-in tools
@@ -342,15 +410,6 @@ If there's nothing noteworthy, respond with an empty string.`,
             this.toolRegistry.register(tool, 'builtin', true);
         }
         logger.info(`Registered ${builtinTools.length} built-in tools`);
-    }
-    /**
-     * Register all built-in skills
-     */
-    registerBuiltinSkills() {
-        for (const skill of builtinSkills) {
-            this.skillManager.register(skill, 'builtin');
-        }
-        logger.info(`Registered ${builtinSkills.length} built-in skills`);
     }
     /**
      * Register default heartbeat tasks
@@ -366,7 +425,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             this.heartbeatManager.register(createCleanupTask({
                 sessionsDir: this.config.storage.sessionDir,
             }));
-            // Daily log archival removed — replaced by context_checkpoint tool
+            // Daily log archival removed  - replaced by context_checkpoint tool
             // Proactive behavior: full 15-min check + fast 2-min sensor check
             this.heartbeatManager.register(this.proactiveBehavior.createHeartbeatTask());
             this.heartbeatManager.register(this.proactiveBehavior.createFastHeartbeatTask());
@@ -462,13 +521,6 @@ If there's nothing noteworthy, respond with an empty string.`,
                 for (const tool of allTools) {
                     toolSummaries[tool.name] = tool.description;
                 }
-                // Get skill info
-                const skillList = this.skillManager.list();
-                const skillNames = skillList.map(s => s.id);
-                const skillDescriptions = {};
-                for (const skillInfo of skillList) {
-                    skillDescriptions[skillInfo.id] = skillInfo.description;
-                }
                 // Build runtime info
                 const runtimeInfo = {
                     agentName: 'ClawdBot',
@@ -483,11 +535,6 @@ If there's nothing noteworthy, respond with an empty string.`,
                     workspaceDir: process.cwd(),
                     tools: allTools,
                     toolSummaries,
-                    skills: {
-                        skillNames,
-                        skillDescriptions,
-                        enabled: skillNames.length > 0,
-                    },
                     memory: {
                         enabled: true,
                         maxMemories: 10,
@@ -495,6 +542,14 @@ If there's nothing noteworthy, respond with an empty string.`,
                     runtime: runtimeInfo,
                     customIdentity: basePrompt.fullPrompt, // Use loaded identity files as base
                 };
+                // Inject skills index into system prompt via custom sections
+                const skillsSection = this.skillStore.buildPromptSection();
+                if (skillsSection) {
+                    promptParams.customSections = [
+                        ...(promptParams.customSections || []),
+                        { title: 'Available Skills', content: skillsSection, priority: 85 },
+                    ];
+                }
                 const systemPromptBuilder = new SystemPromptBuilder(promptParams);
                 const builtSystemPrompt = systemPromptBuilder.build();
                 systemPrompt = builtSystemPrompt.prompt;
@@ -507,7 +562,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             }
         }
         // Create storage
-        const sessionPath = `${this.config.storage.sessionDir}/${sessionId}.json`;
+        const sessionPath = this.buildSessionPath(sessionId);
         const storage = new FileSessionStorage(sessionPath);
         // Create session
         const session = new Session({
@@ -538,7 +593,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         }
         logger.info(`Loading session: ${sessionId}`);
         // Create storage and session
-        const sessionPath = `${this.config.storage.sessionDir}/${sessionId}.json`;
+        const sessionPath = this.buildSessionPath(sessionId);
         const storage = new FileSessionStorage(sessionPath);
         // Check if session exists
         const exists = await storage.exists();
@@ -606,7 +661,13 @@ If there's nothing noteworthy, respond with an empty string.`,
             priority: 'normal',
             timeout: 0, // No lane-level timeout for agent tasks (agents may run many tool iterations)
             execute: async () => {
-                return this.processSendMessage(sessionId, message, attachments);
+                this.activeResponseSessions.add(sessionId);
+                try {
+                    return this.processSendMessage(sessionId, message, attachments);
+                }
+                finally {
+                    this.activeResponseSessions.delete(sessionId);
+                }
             },
         });
     }
@@ -618,7 +679,7 @@ If there's nothing noteworthy, respond with an empty string.`,
      * @param onStream - Callback for streaming updates (delta, accumulated, done)
      * @returns Agent response
      */
-    async sendMessageWithStreaming(sessionId, message, onStream, attachments) {
+    async sendMessageWithStreaming(sessionId, message, onStream, attachments, options) {
         // Use lane system to serialize execution per session
         return this.laneManager.enqueue(sessionId, {
             id: `msg-${Date.now()}`,
@@ -626,7 +687,16 @@ If there's nothing noteworthy, respond with an empty string.`,
             priority: 'normal',
             timeout: 0, // No lane-level timeout for agent tasks
             execute: async () => {
-                return this.processSendMessageWithStreaming(sessionId, message, onStream, attachments);
+                this.activeResponseSessions.add(sessionId);
+                const runId = generateId();
+                this.streamingHandler.emitAgentStart(sessionId, runId);
+                try {
+                    return this.processSendMessageWithStreaming(sessionId, message, onStream, attachments, options);
+                }
+                finally {
+                    this.streamingHandler.emitAgentEnd(sessionId, runId);
+                    this.activeResponseSessions.delete(sessionId);
+                }
             },
         });
     }
@@ -642,11 +712,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                 session = await this.loadSession(sessionId);
             }
             logger.info(`Processing message for session: ${sessionId}`);
-            // 🔑 关键修复：在添加用户消息**之前**检查上下文窗口
-            // 预估添加用户消息后的 token 数
+            // 馃攽 鍏抽敭淇锛氬湪娣诲姞鐢ㄦ埛娑堟伅**涔嬪墠**妫€鏌ヤ笂涓嬫枃绐楀彛
+            // 棰勪及娣诲姞鐢ㄦ埛娑堟伅鍚庣殑 token 鏁?
             const userContent = await this.buildUserContent(message, attachments);
             const tempUserMessage = {
-                id: generateId(), // 临时 ID，实际消息添加时会重新生成
+                id: generateId(), // 涓存椂 ID锛屽疄闄呮秷鎭坊鍔犳椂浼氶噸鏂扮敓鎴?
                 role: 'user',
                 content: userContent,
                 timestamp: Date.now(),
@@ -656,27 +726,28 @@ If there's nothing noteworthy, respond with an empty string.`,
             const currentMessages = session.buildContext();
             const messagesWithUser = [...currentMessages, tempUserMessage];
             const contextStatus = this.contextGuard.checkStatus(messagesWithUser);
-            // 如果添加用户消息后会触发压缩，先压缩再添加
+            // 濡傛灉娣诲姞鐢ㄦ埛娑堟伅鍚庝細瑙﹀彂鍘嬬缉锛屽厛鍘嬬缉鍐嶆坊鍔?
             if (contextStatus.needsCompression) {
                 logger.info(`[AgentManager] Auto-compressing context BEFORE adding user message: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
                 // Perform auto-compression on current messages
                 const compressedMessages = await this.contextGuard.autoCompress(currentMessages);
                 // Update session with compressed messages
                 session.replaceHistory(compressedMessages);
-                logger.info(`[AgentManager] Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`);
+                logger.info(`[AgentManager] Context compressed: ${currentMessages.length}  -> ${compressedMessages.length} messages`);
                 // Emit session:compress event
                 this.eventBus.emit('session:compress', {
                     sessionId,
                     beforeCount: currentMessages.length,
                     afterCount: compressedMessages.length,
                 });
-                this.activityLog.logInfo(`Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`).catch(() => { });
+                this.activityLog.logInfo(`Context compressed: ${currentMessages.length}  -> ${compressedMessages.length} messages`).catch(() => { });
             }
             // Now add user message (with multimodal content if attachments present)
             session.addMessage({
                 role: 'user',
                 content: userContent,
             });
+            this.markUserActivity(sessionId);
             // Log user message
             this.activityLog.logSession(sessionId, 'start', message.slice(0, 80)).catch(() => { });
             // Tool execution loop (no iteration limit - on device, almost all actions are tool calls)
@@ -716,8 +787,8 @@ If there's nothing noteworthy, respond with an empty string.`,
                 // Filter out system message from messages, then repair any orphaned tool_use blocks
                 let messages = sanitizeMessages(context.filter((m) => m.role !== 'system'));
                 // Byte-size pre-check: base64 images have an extreme bytes/token ratio
-                // (each ~500KB–2MB) while token-based compression triggers at 170k tokens.
-                // 3–4 screenshots can exceed 6MB bytes with only ~15k tokens — well below
+                // (each ~500KB - MB) while token-based compression triggers at 170k tokens.
+                // 3 -  screenshots can exceed 6MB bytes with only ~15k tokens  - well below
                 // the compression threshold. Strip images proactively before the API call.
                 messages = this.stripBase64ImagesIfNeeded(messages);
                 // Decide whether to include tools (ToolUsageStrategy)
@@ -726,8 +797,6 @@ If there's nothing noteworthy, respond with an empty string.`,
                 let tools;
                 if (toolDecision.shouldIncludeTools) {
                     const registryTools = this.toolRegistry.toAnthropicFormat();
-                    const skillTools = this.skillManager.toAnthropicFormat();
-                    const allTools = [...registryTools, ...skillTools];
                     if (toolDecision.toolFilter && toolDecision.toolFilter.length > 0) {
                         // Filter tools by category
                         const allRegistered = this.toolRegistry.getAll();
@@ -737,16 +806,12 @@ If there's nothing noteworthy, respond with an empty string.`,
                                 filteredNames.add(reg.name);
                             }
                         }
-                        // Always include skill tools (they have skill_ prefix)
-                        for (const st of skillTools) {
-                            filteredNames.add(st.name);
-                        }
                         tools = filteredNames.size > 0
-                            ? allTools.filter((t) => filteredNames.has(t.name))
-                            : allTools; // fallback to all if filter yields nothing
+                            ? registryTools.filter((t) => filteredNames.has(t.name))
+                            : registryTools; // fallback to all if filter yields nothing
                     }
                     else {
-                        tools = allTools;
+                        tools = registryTools;
                     }
                 }
                 else {
@@ -805,15 +870,14 @@ If there's nothing noteworthy, respond with an empty string.`,
                         }
                         session.addMessage({
                             role: 'tool',
-                            content: typeof toolResult.output === 'string'
-                                ? toolResult.output
-                                : JSON.stringify(toolResult.output ?? ''),
+                            content: this.serializeToolResultForModel(toolResult),
                             metadata: {
                                 tool_call_id: toolCall.id,
                                 tool_name: toolCall.name,
                                 is_error: !toolResult.success,
                             },
                         });
+                        this.markAssistantActivity(sessionId);
                     }
                     // Continue loop to get next response
                     continue;
@@ -831,9 +895,6 @@ If there's nothing noteworthy, respond with an empty string.`,
             if (finalResponse && finalResponse.type === 'text') {
                 const sessionSummary = message.slice(0, 100);
                 this.activityLog.logSession(sessionId, 'end', sessionSummary).catch(() => { });
-                // Proactive analysis after task completion
-                this.proactiveBehavior.analyzeTaskCompletion(sessionSummary, 'success')
-                    .catch(err => logger.debug('[Proactive] Post-task analysis failed:', err));
             }
             // Auto-save if enabled
             if (this.config.agent.autoSave) {
@@ -849,7 +910,7 @@ If there's nothing noteworthy, respond with an empty string.`,
     /**
      * Internal method to process send message with streaming (called by lane)
      */
-    async processSendMessageWithStreaming(sessionId, message, onStream, attachments) {
+    async processSendMessageWithStreaming(sessionId, message, onStream, attachments, options) {
         const requestTimer = performanceMonitor.startTimer(`request:${sessionId}`);
         try {
             // Get or load session
@@ -864,6 +925,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 role: 'user',
                 content: userContent,
             });
+            this.markUserActivity(sessionId);
             // Log user message
             this.activityLog.logSession(sessionId, 'start', message.slice(0, 80)).catch(() => { });
             // Check context window and auto-compress if needed
@@ -872,7 +934,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             if (contextStatus.needsCompression) {
                 logger.info(`[AgentManager] Auto-compressing context: ${contextStatus.currentTokens}/${contextStatus.maxTokens} tokens`);
                 const compressedMessages = await this.contextGuard.autoCompress(currentMessages);
-                logger.info(`[AgentManager] Context compressed: ${currentMessages.length} → ${compressedMessages.length} messages`);
+                logger.info(`[AgentManager] Context compressed: ${currentMessages.length}  -> ${compressedMessages.length} messages`);
                 // Update session with compressed messages
                 session.replaceHistory(compressedMessages);
                 // Emit session:compress event
@@ -881,218 +943,10 @@ If there's nothing noteworthy, respond with an empty string.`,
                     beforeCount: currentMessages.length,
                     afterCount: compressedMessages.length,
                 });
-                this.activityLog.logInfo(`Context compressed: ${currentMessages.length} → ${compressedMessages.length}`).catch(() => { });
+                this.activityLog.logInfo(`Context compressed: ${currentMessages.length}  -> ${compressedMessages.length}`).catch(() => { });
             }
-            // Tool execution loop (no iteration limit)
-            let iteration = 0;
-            let finalResponse = null;
             const accumulatedAttachments = [];
-            while (true) {
-                iteration++;
-                logger.debug(`Tool loop iteration: ${iteration}`);
-                // Build context
-                const context = session.buildContext();
-                logger.debug(`Context size: ${context.length} messages`);
-                // Get system prompt
-                const systemMessage = context.find((m) => m.role === 'system');
-                let systemPrompt = systemMessage
-                    ? typeof systemMessage.content === 'string'
-                        ? systemMessage.content
-                        : ''
-                    : '';
-                // Enrich with memory context (first iteration only)
-                if (iteration === 1) {
-                    try {
-                        const memCtx = await this.memoryStore.getRelevantContext(message);
-                        if (memCtx)
-                            systemPrompt = systemPrompt + '\n\n' + memCtx;
-                    }
-                    catch (err) {
-                        logger.debug('[MemoryStore] Context enrichment failed:', err);
-                    }
-                }
-                // Filter out system message, then repair any orphaned tool_use blocks
-                let messages = sanitizeMessages(context.filter((m) => m.role !== 'system'));
-                // Byte-size pre-check (same reasoning as processSendMessage)
-                messages = this.stripBase64ImagesIfNeeded(messages);
-                // Get tools
-                const toolMode = this.config.agent.toolStrategy || 'auto';
-                const toolDecision = ToolUsageStrategy.analyzeMessage(message, toolMode);
-                let tools;
-                if (toolDecision.shouldIncludeTools) {
-                    const registryTools = this.toolRegistry.toAnthropicFormat();
-                    const skillTools = this.skillManager.toAnthropicFormat();
-                    const allTools = [...registryTools, ...skillTools];
-                    if (toolDecision.toolFilter && toolDecision.toolFilter.length > 0) {
-                        const allRegistered = this.toolRegistry.getAll();
-                        const filteredNames = new Set();
-                        for (const reg of allRegistered) {
-                            if (toolDecision.toolFilter.includes(reg.category)) {
-                                filteredNames.add(reg.name);
-                            }
-                        }
-                        // Always include skill tools
-                        for (const st of skillTools) {
-                            filteredNames.add(st.name);
-                        }
-                        tools = filteredNames.size > 0
-                            ? allTools.filter((t) => filteredNames.has(t.name))
-                            : allTools;
-                    }
-                    else {
-                        tools = allTools;
-                    }
-                }
-                // Use streaming API
-                let accumulatedText = '';
-                let accumulatedReasoningContent = '';
-                let toolCalls = [];
-                let usage;
-                const streamGenerator = this.modelAPI.createMessageStream({
-                    model: session.model,
-                    messages,
-                    maxTokens: this.config.model.maxTokens,
-                    temperature: this.config.model.temperature,
-                    systemPrompt,
-                    tools,
-                }, this.streamingHandler);
-                // Process stream chunks
-                for await (const chunk of streamGenerator) {
-                    if (chunk.type === 'text_delta' && chunk.delta) {
-                        accumulatedText += chunk.delta;
-                        // Call streaming callback
-                        onStream(chunk.delta, accumulatedText, false);
-                    }
-                    else if (chunk.type === 'thinking_delta' && chunk.delta) {
-                        // Accumulate reasoning content for DeepSeek reasoner
-                        accumulatedReasoningContent += chunk.delta;
-                    }
-                    else if (chunk.type === 'tool_use_start' && chunk.toolCall) {
-                        // Tool call detected - id and name are guaranteed on tool_use_start
-                        toolCalls.push({
-                            id: chunk.toolCall.id,
-                            name: chunk.toolCall.name,
-                            input: {},
-                        });
-                    }
-                    else if (chunk.type === 'tool_use_delta') {
-                        // Update tool input - delta contains the JSON fragment
-                        const lastTool = toolCalls[toolCalls.length - 1];
-                        if (lastTool && chunk.delta) {
-                            // Accumulate JSON input
-                            if (!lastTool._inputJson) {
-                                lastTool._inputJson = '';
-                            }
-                            lastTool._inputJson += chunk.delta;
-                        }
-                    }
-                    else if (chunk.type === 'tool_use_end') {
-                        // Parse accumulated input JSON
-                        const lastTool = toolCalls[toolCalls.length - 1];
-                        if (lastTool && lastTool._inputJson) {
-                            try {
-                                lastTool.input = JSON.parse(lastTool._inputJson);
-                            }
-                            catch {
-                                lastTool.input = {};
-                            }
-                            delete lastTool._inputJson;
-                        }
-                    }
-                    else if (chunk.type === 'message_end' && chunk.usage) {
-                        usage = {
-                            inputTokens: chunk.usage.inputTokens ?? 0,
-                            outputTokens: chunk.usage.outputTokens ?? 0,
-                        };
-                    }
-                }
-                // Signal streaming done for this iteration
-                if (accumulatedText && toolCalls.length === 0) {
-                    onStream('', accumulatedText, true);
-                }
-                // If we got tool calls, handle them
-                if (toolCalls.length > 0) {
-                    logger.info(`Tool calls detected: ${toolCalls.length} tools`);
-                    // Add assistant message with tool calls
-                    // Include reasoning_content for DeepSeek reasoner tool call loops
-                    const metadata = {
-                        toolCalls: toolCalls.map(tc => ({
-                            id: tc.id,
-                            name: tc.name,
-                            input: tc.input,
-                        })),
-                    };
-                    if (accumulatedReasoningContent) {
-                        metadata.reasoning_content = accumulatedReasoningContent;
-                    }
-                    session.addMessage({
-                        role: 'assistant',
-                        content: accumulatedText || '',
-                        metadata,
-                    });
-                    // Request approvals and execute tools
-                    const approvedToolCalls = [];
-                    const deniedToolCalls = [];
-                    for (const toolCall of toolCalls) {
-                        try {
-                            const approvalResponse = await this.approvalManager.requestApproval(toolCall.name, toolCall.input, session.sessionId, `Tool: ${toolCall.name}`);
-                            if (approvalResponse.approved) {
-                                approvedToolCalls.push(toolCall);
-                            }
-                            else {
-                                deniedToolCalls.push(toolCall);
-                                logger.warn(`Tool ${toolCall.name} denied`);
-                            }
-                        }
-                        catch (error) {
-                            deniedToolCalls.push(toolCall);
-                            logger.error(`Approval failed for ${toolCall.name}:`, error);
-                        }
-                    }
-                    // Execute approved tools with intelligent parallelization
-                    const toolResults = await this.executeToolsWithParallelization(approvedToolCalls, deniedToolCalls, session);
-                    // Add tool results
-                    for (let i = 0; i < toolResults.length; i++) {
-                        const toolCall = [...approvedToolCalls, ...deniedToolCalls][i];
-                        const toolResult = toolResults[i];
-                        // Accumulate attachments from tool results
-                        if ('attachments' in toolResult && toolResult.attachments) {
-                            accumulatedAttachments.push(...toolResult.attachments);
-                        }
-                        session.addMessage({
-                            role: 'tool',
-                            content: typeof toolResult.output === 'string'
-                                ? toolResult.output
-                                : JSON.stringify(toolResult.output ?? ''),
-                            metadata: {
-                                tool_call_id: toolCall.id,
-                                tool_name: toolCall.name,
-                                is_error: !toolResult.success,
-                            },
-                        });
-                    }
-                    continue;
-                }
-                // Text response - we're done
-                if (accumulatedText) {
-                    session.addMessage({
-                        role: 'assistant',
-                        content: accumulatedText,
-                        metadata: {
-                            model: session.model,
-                            tokens: usage ? usage.inputTokens + usage.outputTokens : undefined,
-                            attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
-                        },
-                    });
-                    finalResponse = {
-                        type: 'text',
-                        content: accumulatedText,
-                        usage,
-                        attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
-                    };
-                    break;
-                }
-            }
+            const finalResponse = await this.runStreamingConversationLoop(session, sessionId, message, onStream, accumulatedAttachments, options);
             // Record performance
             const requestDuration = requestTimer.end();
             performanceMonitor.recordRequest(requestDuration);
@@ -1113,6 +967,294 @@ If there's nothing noteworthy, respond with an empty string.`,
         }
     }
     /**
+     * Approve a batch of tool calls.
+     */
+    async approveToolCalls(toolCalls, session) {
+        const approvedToolCalls = [];
+        const deniedToolCalls = [];
+        for (const toolCall of toolCalls) {
+            try {
+                const approvalResponse = await this.approvalManager.requestApproval(toolCall.name, toolCall.input, session.sessionId, `Tool: ${toolCall.name}`);
+                if (approvalResponse.approved) {
+                    approvedToolCalls.push(toolCall);
+                }
+                else {
+                    deniedToolCalls.push(toolCall);
+                    logger.warn(`Tool ${toolCall.name} denied`);
+                }
+            }
+            catch (error) {
+                deniedToolCalls.push(toolCall);
+                logger.error(`Approval failed for ${toolCall.name}:`, error);
+            }
+        }
+        return { approvedToolCalls, deniedToolCalls };
+    }
+    /**
+     * Execute tool calls, append results to the session, and collect attachments.
+     */
+    async executeToolCallsAndAppendResults(session, approvedToolCalls, deniedToolCalls, accumulatedAttachments) {
+        const toolResults = await this.executeToolsWithParallelization(approvedToolCalls, deniedToolCalls, session);
+        for (let i = 0; i < toolResults.length; i++) {
+            const toolCall = [...approvedToolCalls, ...deniedToolCalls][i];
+            const toolResult = toolResults[i];
+            if ('attachments' in toolResult && toolResult.attachments) {
+                accumulatedAttachments.push(...toolResult.attachments);
+            }
+            session.addMessage({
+                role: 'tool',
+                content: this.serializeToolResultForModel(toolResult),
+                metadata: {
+                    tool_call_id: toolCall.id,
+                    tool_name: toolCall.name,
+                    is_error: !toolResult.success,
+                },
+            });
+        }
+    }
+    /**
+     * Continue tool execution in the background at low lane priority.
+     * If the user sends a newer message before the continuation starts, it is skipped.
+     */
+    queueBackgroundToolContinuation(sessionId, originatingMessage, approvedToolCalls, deniedToolCalls, accumulatedAttachments, scheduledUserActivityAt) {
+        const taskId = generateId();
+        void this.laneManager.enqueue(sessionId, {
+            id: taskId,
+            name: `backgroundContinuation:${sessionId}`,
+            priority: 'low',
+            timeout: 0,
+            execute: async () => {
+                if (this.shouldSkipBackgroundContinuation(sessionId, scheduledUserActivityAt)) {
+                    logger.info(`[AgentManager] Skipping stale background continuation for session ${sessionId}`);
+                    let session = this.sessions.get(sessionId);
+                    if (!session) {
+                        session = await this.loadSession(sessionId);
+                    }
+                    for (const toolCall of [...approvedToolCalls, ...deniedToolCalls]) {
+                        session.addMessage({
+                            role: 'tool',
+                            content: 'Tool execution was interrupted by a newer user message.',
+                            metadata: {
+                                tool_call_id: toolCall.id,
+                                tool_name: toolCall.name,
+                                is_error: true,
+                            },
+                        });
+                    }
+                    if (this.config.agent.autoSave) {
+                        await session.save();
+                    }
+                    return;
+                }
+                let session = this.sessions.get(sessionId);
+                if (!session) {
+                    session = await this.loadSession(sessionId);
+                }
+                const runId = generateId();
+                this.streamingHandler.emitAgentStart(sessionId, runId);
+                try {
+                    await this.executeToolCallsAndAppendResults(session, approvedToolCalls, deniedToolCalls, accumulatedAttachments);
+                    const response = await this.runStreamingConversationLoop(session, sessionId, originatingMessage, () => { }, accumulatedAttachments, { allowBackgroundContinuation: false });
+                    if (response.type === 'error') {
+                        logger.warn(`[AgentManager] Background continuation ended with error: ${response.content}`);
+                    }
+                    if (this.config.agent.autoSave) {
+                        await session.save();
+                    }
+                }
+                catch (error) {
+                    this.streamingHandler.emitError('BACKGROUND_CONTINUATION_FAILED', error instanceof Error ? error.message : 'Background continuation failed', true, error);
+                    throw error;
+                }
+                finally {
+                    this.streamingHandler.emitAgentEnd(sessionId, runId);
+                }
+            },
+        }).catch((error) => {
+            logger.error(`[AgentManager] Failed to enqueue background continuation for ${sessionId}:`, error);
+        });
+    }
+    /**
+     * Shared streaming loop used by the foreground request and background continuation.
+     */
+    async runStreamingConversationLoop(session, sessionId, message, onStream, accumulatedAttachments, options) {
+        let iteration = 0;
+        while (true) {
+            iteration++;
+            logger.debug(`Tool loop iteration: ${iteration}`);
+            const context = session.buildContext();
+            logger.debug(`Context size: ${context.length} messages`);
+            const systemMessage = context.find((m) => m.role === 'system');
+            let systemPrompt = systemMessage
+                ? typeof systemMessage.content === 'string'
+                    ? systemMessage.content
+                    : ''
+                : '';
+            if (iteration === 1) {
+                try {
+                    const memCtx = await this.memoryStore.getRelevantContext(message);
+                    if (memCtx)
+                        systemPrompt = systemPrompt + '\n\n' + memCtx;
+                }
+                catch (err) {
+                    logger.debug('[MemoryStore] Context enrichment failed:', err);
+                }
+            }
+            let messages = sanitizeMessages(context.filter((m) => m.role !== 'system'));
+            messages = this.stripBase64ImagesIfNeeded(messages);
+            const toolMode = this.config.agent.toolStrategy || 'auto';
+            const toolDecision = ToolUsageStrategy.analyzeMessage(message, toolMode);
+            let tools;
+            if (toolDecision.shouldIncludeTools) {
+                const registryTools = this.toolRegistry.toAnthropicFormat();
+                if (toolDecision.toolFilter && toolDecision.toolFilter.length > 0) {
+                    const allRegistered = this.toolRegistry.getAll();
+                    const filteredNames = new Set();
+                    for (const reg of allRegistered) {
+                        if (toolDecision.toolFilter.includes(reg.category)) {
+                            filteredNames.add(reg.name);
+                        }
+                    }
+                    tools = filteredNames.size > 0
+                        ? registryTools.filter((t) => filteredNames.has(t.name))
+                        : registryTools;
+                }
+                else {
+                    tools = registryTools;
+                }
+            }
+            let accumulatedText = '';
+            let accumulatedReasoningContent = '';
+            let providerContent;
+            let toolCalls = [];
+            let usage;
+            const streamGenerator = this.modelAPI.createMessageStream({
+                model: session.model,
+                messages,
+                maxTokens: this.config.model.maxTokens,
+                temperature: this.config.model.temperature,
+                systemPrompt,
+                tools,
+            }, this.streamingHandler);
+            for await (const chunk of streamGenerator) {
+                if (chunk.type === 'text_delta' && chunk.delta) {
+                    accumulatedText += chunk.delta;
+                    onStream(chunk.delta, accumulatedText, false);
+                }
+                else if (chunk.type === 'thinking_delta' && chunk.delta) {
+                    accumulatedReasoningContent += chunk.delta;
+                }
+                else if (chunk.type === 'tool_use_start' && chunk.toolCall) {
+                    toolCalls.push({
+                        id: chunk.toolCall.id,
+                        name: chunk.toolCall.name,
+                        input: {},
+                    });
+                }
+                else if (chunk.type === 'tool_use_delta') {
+                    const targetTool = chunk.toolCall?.id
+                        ? toolCalls.find((toolCall) => toolCall.id === chunk.toolCall.id)
+                        : toolCalls[toolCalls.length - 1];
+                    if (targetTool && chunk.delta) {
+                        if (!targetTool._inputJson) {
+                            targetTool._inputJson = '';
+                        }
+                        targetTool._inputJson += chunk.delta;
+                    }
+                }
+                else if (chunk.type === 'tool_use_end') {
+                    const targetTool = chunk.toolCall?.id
+                        ? toolCalls.find((toolCall) => toolCall.id === chunk.toolCall.id)
+                        : toolCalls[toolCalls.length - 1];
+                    if (targetTool && targetTool._inputJson) {
+                        try {
+                            targetTool.input = JSON.parse(targetTool._inputJson);
+                        }
+                        catch {
+                            targetTool.input = {};
+                        }
+                        delete targetTool._inputJson;
+                    }
+                }
+                else if (chunk.type === 'message_end') {
+                    if (chunk.usage) {
+                        usage = {
+                            inputTokens: chunk.usage.inputTokens ?? 0,
+                            outputTokens: chunk.usage.outputTokens ?? 0,
+                        };
+                    }
+                    if (chunk.providerContent) {
+                        providerContent = chunk.providerContent;
+                    }
+                }
+            }
+            if (accumulatedText && toolCalls.length === 0) {
+                onStream('', accumulatedText, true);
+            }
+            if (toolCalls.length > 0) {
+                logger.info(`Tool calls detected: ${toolCalls.length} tools`);
+                const metadata = {
+                    toolCalls: toolCalls.map(tc => ({
+                        id: tc.id,
+                        name: tc.name,
+                        input: tc.input,
+                    })),
+                };
+                if (accumulatedReasoningContent) {
+                    metadata.reasoning_content = accumulatedReasoningContent;
+                }
+                if (providerContent) {
+                    metadata.providerContent = providerContent;
+                }
+                session.addMessage({
+                    role: 'assistant',
+                    content: accumulatedText || '',
+                    metadata,
+                });
+                this.markAssistantActivity(sessionId);
+                this.emitAssistantMessage(sessionId, accumulatedText || '');
+                const { approvedToolCalls, deniedToolCalls } = await this.approveToolCalls(toolCalls, session);
+                if (options?.allowBackgroundContinuation && accumulatedText.trim()) {
+                    onStream('', accumulatedText, true);
+                    this.queueBackgroundToolContinuation(sessionId, message, approvedToolCalls, deniedToolCalls, [...accumulatedAttachments], this.sessionLastUserActivity.get(sessionId) || Date.now());
+                    return {
+                        type: 'text',
+                        content: accumulatedText,
+                        usage,
+                        attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
+                        backgroundContinues: true,
+                    };
+                }
+                await this.executeToolCallsAndAppendResults(session, approvedToolCalls, deniedToolCalls, accumulatedAttachments);
+                continue;
+            }
+            if (accumulatedText) {
+                session.addMessage({
+                    role: 'assistant',
+                    content: accumulatedText,
+                    metadata: {
+                        model: session.model,
+                        tokens: usage ? usage.inputTokens + usage.outputTokens : undefined,
+                        attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
+                        providerContent: providerContent || undefined,
+                    },
+                });
+                this.markAssistantActivity(sessionId);
+                this.emitAssistantMessage(sessionId, accumulatedText);
+                return {
+                    type: 'text',
+                    content: accumulatedText,
+                    usage,
+                    attachments: accumulatedAttachments.length > 0 ? accumulatedAttachments : undefined,
+                };
+            }
+            return {
+                type: 'error',
+                content: 'Model returned no text and no tool calls.',
+            };
+        }
+    }
+    /**
      * Process model response
      *
      * @param session - Current session
@@ -1129,8 +1271,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                     model: session.model,
                     tokens: modelResponse.usage?.inputTokens + modelResponse.usage?.outputTokens,
                     attachments: attachments?.length ? attachments : undefined,
+                    providerContent: modelResponse.providerContent || undefined,
                 },
             });
+            this.markAssistantActivity(session.sessionId);
+            this.emitAssistantMessage(session.sessionId, modelResponse.content);
             return {
                 type: 'text',
                 content: modelResponse.content,
@@ -1148,8 +1293,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                     model: session.model,
                     toolCalls: modelResponse.toolCalls,
                     reasoning_content: modelResponse.reasoningContent || undefined,
+                    providerContent: modelResponse.providerContent || undefined,
                 },
             });
+            this.markAssistantActivity(session.sessionId);
+            this.emitAssistantMessage(session.sessionId, modelResponse.content || '');
             return {
                 type: 'tool_calls',
                 content: modelResponse.content || 'Executing tools...',
@@ -1169,14 +1317,14 @@ If there's nothing noteworthy, respond with an empty string.`,
      * Strip base64 image blocks from messages when the estimated JSON body would
      * approach the ACS request-body hard limit (6 MB).
      *
-     * WHY: Anthropic counts image tokens by dimensions (~1–5k tokens/image), but
-     * each base64 screenshot is 500KB–2MB. Token-based compression (threshold:
-     * 170k tokens) never fires when there are only 3–4 screenshots, yet bytes
+     * WHY: Anthropic counts image tokens by dimensions (~1 - k tokens/image), but
+     * each base64 screenshot is 500KB - MB. Token-based compression (threshold:
+     * 170k tokens) never fires when there are only 3 -  screenshots, yet bytes
      * can already exceed 6MB. Stripping happens before the API call, so the
      * reactive trimMessagesToBodyLimit() in ModelAPI is a last resort only.
      */
     stripBase64ImagesIfNeeded(messages) {
-        const BYTE_THRESHOLD = 4 * 1024 * 1024; // 4 MB — comfortable margin under 6 MB
+        const BYTE_THRESHOLD = 4 * 1024 * 1024; // 4 MB  - comfortable margin under 6 MB
         const estimatedBytes = JSON.stringify(messages).length;
         if (estimatedBytes <= BYTE_THRESHOLD)
             return messages;
@@ -1357,31 +1505,6 @@ If there's nothing noteworthy, respond with an empty string.`,
             this.heartbeatManager.pause(taskId);
         }
     }
-    // ===== Skills API =====
-    /**
-     * Get skill manager
-     */
-    getSkillManager() {
-        return this.skillManager;
-    }
-    /**
-     * Execute a skill by ID
-     */
-    async executeSkill(skillId, params = {}) {
-        return this.skillManager.execute(skillId, params);
-    }
-    /**
-     * List available skills
-     */
-    listSkills() {
-        return this.skillManager.list();
-    }
-    /**
-     * Search skills
-     */
-    searchSkills(query) {
-        return this.skillManager.search(query);
-    }
     // ===== Identity/Prompt API =====
     /**
      * Get prompt builder (identity system)
@@ -1408,11 +1531,11 @@ If there's nothing noteworthy, respond with an empty string.`,
         const adapters = [
             { platformName: 'telegram', displayName: 'Telegram', factory: () => new TelegramAdapter() },
             { platformName: 'discord', displayName: 'Discord', factory: () => new DiscordAdapter() },
-            { platformName: 'feishu', displayName: '飞书', factory: () => new FeishuAdapter() },
-            { platformName: 'dingtalk', displayName: '钉钉', factory: () => new DingTalkAdapter() },
+            { platformName: 'feishu', displayName: '\u98de\u4e66', factory: () => new FeishuAdapter() },
+            { platformName: 'dingtalk', displayName: '\u9489\u9489', factory: () => new DingTalkAdapter() },
             { platformName: 'qq', displayName: 'QQ', factory: () => new QQAdapter() },
             { platformName: 'qq-guild', displayName: 'QQ Guild', factory: () => new QQGuildAdapter() },
-            { platformName: 'wechat', displayName: '微信', factory: () => new WeChatAdapter() },
+            { platformName: 'wechat', displayName: '\u5fae\u4fe1', factory: () => new WeChatAdapter() },
         ];
         for (const reg of adapters) {
             this.socialManager.registerAdapter(reg);
@@ -1428,7 +1551,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             logger.info('[Social] No social config found, skipping');
             return;
         }
-        // Map app config fields → PlatformConfig format
+        // Map app config fields  -> PlatformConfig format
         const platforms = {};
         if (socialConfig.telegram) {
             platforms['telegram'] = {
@@ -1488,7 +1611,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 this.socialManager.setDefaultChannel(name, cfg.broadcastChatId);
             }
         }
-        // Initialize asynchronously — don't block constructor
+        // Initialize asynchronously  - don't block constructor
         this.socialManager.initialize({
             platforms,
             messageHandler: async (message) => {
@@ -1498,6 +1621,28 @@ If there's nothing noteworthy, respond with an empty string.`,
             logger.info('[Social] Social platform initialization complete');
         }).catch(err => {
             logger.error('[Social] Social platform initialization failed:', err);
+        });
+    }
+    /**
+     * Serialize tool output for the model while preserving attachment availability.
+     */
+    serializeToolResultForModel(toolResult) {
+        const baseContent = typeof toolResult.output === 'string'
+            ? toolResult.output
+            : JSON.stringify(toolResult.output ?? '');
+        if (!toolResult.attachments?.length) {
+            return baseContent;
+        }
+        const attachmentSummary = toolResult.attachments.map((attachment) => ({
+            type: attachment.type,
+            filename: attachment.filename || attachment.localPath.split(/[\\/]/).pop() || attachment.localPath,
+            localPath: attachment.localPath,
+            mimeType: attachment.mimeType ?? null,
+        }));
+        return JSON.stringify({
+            output: toolResult.output ?? '',
+            attachments: attachmentSummary,
+            attachment_delivery: 'These attachments are available output artifacts. On hosts that support media, they can be sent directly to the user. If an image attachment was returned successfully, acknowledge it as sent or attached instead of claiming the channel is text-only.',
         });
     }
     /**
@@ -1513,48 +1658,14 @@ If there's nothing noteworthy, respond with an empty string.`,
         }
         const isAnthropic = this.config.model.provider === 'anthropic';
         for (const att of attachments) {
+            const localPath = att.localPath ||
+                (att.url && !this.isRemoteAttachmentUrl(att.url) ? att.url : '');
+            const remoteUrl = att.url && this.isRemoteAttachmentUrl(att.url) ? att.url : undefined;
             if (att.type === 'image') {
-                if (att.url) {
-                    if (isAnthropic) {
-                        // Anthropic requires base64 — download the image
-                        try {
-                            const result = await this.modelAPI.downloadToBase64(att.url);
-                            if (result) {
-                                contentBlocks.push({
-                                    type: 'image',
-                                    source: {
-                                        type: 'base64',
-                                        media_type: result.media_type,
-                                        data: result.data,
-                                    },
-                                });
-                            }
-                            else {
-                                logger.warn(`[AgentManager] Failed to download image for Anthropic, degrading to text: ${att.url}`);
-                                contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.url} (download failed)]` });
-                            }
-                        }
-                        catch (err) {
-                            logger.warn('[AgentManager] Image download error:', err);
-                            contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.url} (error)]` });
-                        }
-                    }
-                    else {
-                        // OpenAI/Gemini support URL images directly
-                        contentBlocks.push({
-                            type: 'image',
-                            source: {
-                                type: 'url',
-                                media_type: att.mimeType || 'image/jpeg',
-                                data: att.url,
-                            },
-                        });
-                    }
-                }
-                else if (att.localPath) {
-                    // Local file — read as base64
+                if (localPath) {
+                    // Local file  -> read as base64
                     try {
-                        const base64Data = await this.readFileAsBase64(att.localPath);
+                        const base64Data = await this.readFileAsBase64(localPath);
                         if (base64Data) {
                             contentBlocks.push({
                                 type: 'image',
@@ -1566,22 +1677,59 @@ If there's nothing noteworthy, respond with an empty string.`,
                             });
                         }
                         else {
-                            contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.localPath} (failed to read)]` });
+                            contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || localPath} (failed to read)]` });
                         }
                     }
                     catch (err) {
                         logger.warn('[AgentManager] Failed to read image file:', err);
-                        contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || att.localPath} (error)]` });
+                        contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || localPath} (error)]` });
+                    }
+                }
+                else if (remoteUrl) {
+                    if (isAnthropic) {
+                        // Anthropic requires base64  - download the image
+                        try {
+                            const result = await this.modelAPI.downloadToBase64(remoteUrl);
+                            if (result) {
+                                contentBlocks.push({
+                                    type: 'image',
+                                    source: {
+                                        type: 'base64',
+                                        media_type: result.media_type,
+                                        data: result.data,
+                                    },
+                                });
+                            }
+                            else {
+                                logger.warn(`[AgentManager] Failed to download image for Anthropic, degrading to text: ${remoteUrl}`);
+                                contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || remoteUrl} (download failed)]` });
+                            }
+                        }
+                        catch (err) {
+                            logger.warn('[AgentManager] Image download error:', err);
+                            contentBlocks.push({ type: 'text', text: `[Image: ${att.filename || remoteUrl} (error)]` });
+                        }
+                    }
+                    else {
+                        // OpenAI/Gemini support URL images directly
+                        contentBlocks.push({
+                            type: 'image',
+                            source: {
+                                type: 'url',
+                                media_type: att.mimeType || 'image/jpeg',
+                                data: remoteUrl,
+                            },
+                        });
                     }
                 }
             }
             else {
-                // Non-image files (video, audio, file) — degrade to text description
+                // Non-image files (video, audio, file)  - degrade to text description
                 contentBlocks.push({
                     type: 'file',
                     source: {
                         type: 'url',
-                        url: att.url || att.localPath,
+                        url: remoteUrl || localPath,
                         filename: att.filename,
                         mimeType: att.mimeType,
                     },
@@ -1605,6 +1753,9 @@ If there's nothing noteworthy, respond with an empty string.`,
             return null;
         }
     }
+    isRemoteAttachmentUrl(value) {
+        return typeof value === 'string' && /^https?:\/\//i.test(value);
+    }
     /**
      * Convert MediaAttachments to SocialAttachments for platform sending
      */
@@ -1613,13 +1764,14 @@ If there's nothing noteworthy, respond with an empty string.`,
             return undefined;
         return attachments.map(att => ({
             type: att.type,
-            url: att.localPath,
+            url: att.url || att.localPath || '',
+            localPath: att.localPath || undefined,
             filename: att.filename,
             mimeType: att.mimeType,
         }));
     }
     /**
-     * Handle incoming social platform message → route to agent → reply with streaming
+     * Handle incoming social platform message  -> route to agent  -> reply with streaming
      */
     async handleSocialMessage(message) {
         const chatKey = `${message.platform}:${message.chatId}`;
@@ -1638,11 +1790,11 @@ If there's nothing noteworthy, respond with an empty string.`,
                 }
             }
             logger.info(`[Social] Message from ${message.platform}/${message.username}: ${(message.text || '').substring(0, 80)}${message.attachments?.length ? ` [+${message.attachments.length} attachments]` : ''}`);
-            // Convert SocialAttachment[] → MediaAttachment[]
+            // Convert SocialAttachment[]  -> MediaAttachment[]
             const incomingAttachments = message.attachments?.map(att => ({
                 type: att.type,
-                localPath: '',
-                url: att.url,
+                localPath: att.localPath || (this.isRemoteAttachmentUrl(att.url) ? '' : att.url),
+                url: this.isRemoteAttachmentUrl(att.url) ? att.url : undefined,
                 filename: att.filename,
                 mimeType: att.mimeType,
             }));
@@ -1667,7 +1819,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                     // Send initial placeholder
                     sentMessageId = await this.socialManager.sendMessageWithId(message.platform, {
                         chatId: message.chatId,
-                        text: '思考中...',
+                        text: '\u601d\u8003\u4e2d...',
                         replyTo: message.messageId,
                     });
                 }
@@ -1685,7 +1837,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                                 // Show typing indicator with partial content
                                 const displayText = done
                                     ? accumulated
-                                    : accumulated + ' ▌';
+                                    : accumulated + ' ...';
                                 await this.socialManager.editMessage(message.platform, message.chatId, sentMessageId, displayText || '...');
                             }
                             catch (err) {
@@ -1755,7 +1907,7 @@ If there's nothing noteworthy, respond with an empty string.`,
             try {
                 await this.socialManager.sendMessage(message.platform, {
                     chatId: message.chatId,
-                    text: `抱歉，处理消息时出错: ${error.message}`,
+                    text: `\u62b1\u6b49\uff0c\u5904\u7406\u6d88\u606f\u65f6\u51fa\u9519: ${error.message}`,
                     replyTo: message.messageId,
                 });
             }
@@ -1776,6 +1928,9 @@ If there's nothing noteworthy, respond with an empty string.`,
     getSocialStatus() {
         return this.socialManager.getStatus();
     }
+    getStreamingHandler() {
+        return this.streamingHandler;
+    }
     // ===== Memory System API =====
     /**
      * Get memory system
@@ -1794,31 +1949,34 @@ If there's nothing noteworthy, respond with an empty string.`,
      * Also sends a system notification as a heads-up.
      */
     async injectProactiveMessage(msg) {
-        // 1. System notification (always, so user is alerted even with chat closed)
-        if (typeof notification !== 'undefined') {
-            try {
-                await notification.show('🤖 助手主动提醒', msg.slice(0, 160));
-            }
-            catch { /* silent */ }
-        }
-        // 2. Inject into the most recently active session
         try {
-            const activeSessions = this.getActiveSessions();
-            if (activeSessions.length === 0)
+            const targetId = this.getMostRecentlyActiveSessionId();
+            if (!targetId)
                 return;
-            const targetId = activeSessions[activeSessions.length - 1];
+            if (this.shouldSuppressProactiveDuringChat(targetId)) {
+                logger.info('[Proactive] Suppressed proactive message during active chat');
+                return;
+            }
             const session = this.sessions.get(targetId);
             if (!session)
                 return;
-            const content = `> 🤖 **主动提醒**\n\n${msg}`;
+            if (typeof notification !== 'undefined') {
+                try {
+                    await notification.show('Proactive reminder', msg.slice(0, 160));
+                }
+                catch {
+                    // Ignore notification failures.
+                }
+            }
+            const content = `> [Proactive]\n\n${msg}`;
             session.addMessage({ role: 'assistant', content });
+            this.markAssistantActivity(targetId);
+            this.emitAssistantMessage(targetId, content);
             await session.save();
-            // Notify UI layer
             this.eventBus.emit('proactiveMessage', { sessionId: targetId, content });
             logger.info(`[Proactive] Injected message into session ${targetId.slice(0, 8)}`);
-            // 3. Also broadcast to social channels if configured
-            if (this.socialManager) {
-                this.socialManager.broadcast(`🤖 ${msg}`).catch(() => { });
+            if (this.socialManager && !this.shouldSuppressProactiveDuringChat()) {
+                this.socialManager.broadcast(`[Proactive] ${msg}`).catch(() => { });
             }
         }
         catch (e) {
@@ -1869,7 +2027,7 @@ If there's nothing noteworthy, respond with an empty string.`,
         if (!session) {
             throw new Error(`Session not found: ${sessionId}`);
         }
-        const sessionPath = `${this.config.storage.sessionDir}/${sessionId}.json`;
+        const sessionPath = this.buildSessionPath(sessionId);
         const storage = new FileSessionStorage(sessionPath);
         return storage.exportSession(exportPath);
     }
@@ -1879,7 +2037,7 @@ If there's nothing noteworthy, respond with an empty string.`,
      */
     async importSession(importPath, targetSessionId) {
         const sessionId = targetSessionId || generateSessionId();
-        const sessionPath = `${this.config.storage.sessionDir}/${sessionId}.json`;
+        const sessionPath = this.buildSessionPath(sessionId);
         const storage = new FileSessionStorage(sessionPath);
         await storage.importSession(importPath);
         // Load the imported session
@@ -1905,7 +2063,7 @@ If there's nothing noteworthy, respond with an empty string.`,
                 logger.debug('[ToolHook:memory-logger] Failed to log:', err);
             }
         }, 0);
-        // After-hook: screenshot-ocr hint — append OCR suggestion when screenshot is taken
+        // After-hook: screenshot-ocr hint  - append OCR suggestion when screenshot is taken
         this.toolHooksManager.onAfterToolCall('screenshot-ocr-hint', async (ctx) => {
             if ((ctx.toolName === 'android_screenshot' || ctx.toolName === 'android_take_screenshot') &&
                 !ctx.isError) {
@@ -1925,7 +2083,7 @@ If there's nothing noteworthy, respond with an empty string.`,
      * Register EventBus consumers for cross-system coordination
      */
     registerEventBusConsumers() {
-        // tool:after → log to DailyLog
+        // tool:after  -> log to DailyLog
         this.eventBus.on('tool:after', async (data) => {
             try {
                 await this.activityLog.logTool(data.toolName, data.duration, false);
@@ -1934,16 +2092,16 @@ If there's nothing noteworthy, respond with an empty string.`,
                 // silent
             }
         });
-        // session:compress → log compression event
+        // session:compress  -> log compression event
         this.eventBus.on('session:compress', async (data) => {
             try {
-                await this.activityLog.logInfo(`Context compressed: ${data.beforeCount} → ${data.afterCount} (${data.sessionId.slice(0, 8)})`);
+                await this.activityLog.logInfo(`Context compressed: ${data.beforeCount}  -> ${data.afterCount} (${data.sessionId.slice(0, 8)})`);
             }
             catch (err) {
                 // silent
             }
         });
-        // memory:saved → log memory event
+        // memory:saved  -> log memory event
         this.eventBus.on('memory:saved', async (data) => {
             try {
                 await this.activityLog.logMemory(data.title, data.tags);
@@ -2031,70 +2189,61 @@ If there's nothing noteworthy, respond with an empty string.`,
                 sessionId: session.sessionId,
             });
             let result;
-            // Route skill_* calls to SkillManager
-            if (toolCall.name.startsWith('skill_')) {
-                const skillId = toolCall.name.replace('skill_', '');
-                const skillResult = await this.skillManager.execute(skillId, toolCall.input);
+            // Execute before hooks
+            const hookCtx = {
+                callId: toolCall.id,
+                toolName: toolCall.name,
+                args: toolCall.input,
+                sessionId: session.sessionId,
+                timestamp: Date.now(),
+            };
+            const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
+            if (!beforeResult.proceed) {
                 result = {
-                    success: skillResult.success,
-                    output: skillResult.output != null
-                        ? (typeof skillResult.output === 'string' ? skillResult.output : JSON.stringify(skillResult.output))
-                        : skillResult.error || 'Skill completed',
-                    error: skillResult.error
+                    success: beforeResult.overrideResult !== undefined,
+                    output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
+                    error: beforeResult.overrideResult === undefined
                         ? {
-                            code: 'SKILL_ERROR',
-                            message: skillResult.error,
+                            code: 'HOOK_BLOCKED',
+                            message: beforeResult.blockReason || 'Blocked by hook',
                         }
                         : undefined,
                 };
             }
             else {
-                // Execute before hooks
-                const hookCtx = {
-                    callId: toolCall.id,
+                const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
+                result = await this.toolExecutor.execute({ ...toolCall, input: effectiveInput }, { context: { sessionId: session.sessionId } });
+            }
+            // Execute after hooks
+            const afterCtx = {
+                ...hookCtx,
+                result: result.output,
+                isError: !result.success,
+                duration: Date.now() - hookCtx.timestamp,
+            };
+            const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
+            if (afterResult.modifiedResult !== undefined) {
+                result.output = afterResult.modifiedResult;
+            }
+            const toolDuration = toolTimer.end();
+            if (result.success) {
+                this.eventBus.emit('tool:after', {
                     toolName: toolCall.name,
                     args: toolCall.input,
-                    sessionId: session.sessionId,
-                    timestamp: Date.now(),
-                };
-                const beforeResult = await this.toolHooksManager.executeBefore(hookCtx);
-                if (!beforeResult.proceed) {
-                    result = {
-                        success: beforeResult.overrideResult !== undefined,
-                        output: beforeResult.overrideResult ?? beforeResult.blockReason ?? 'Blocked by hook',
-                        error: beforeResult.overrideResult === undefined
-                            ? {
-                                code: 'HOOK_BLOCKED',
-                                message: beforeResult.blockReason || 'Blocked by hook',
-                            }
-                            : undefined,
-                    };
-                }
-                else {
-                    const effectiveInput = beforeResult.modifiedArgs || toolCall.input;
-                    result = await this.toolExecutor.execute({ ...toolCall, input: effectiveInput }, { context: { sessionId: session.sessionId } });
-                }
-                // Execute after hooks
-                const afterCtx = {
-                    ...hookCtx,
                     result: result.output,
-                    isError: !result.success,
-                    duration: Date.now() - hookCtx.timestamp,
-                };
-                const afterResult = await this.toolHooksManager.executeAfter(afterCtx);
-                if (afterResult.modifiedResult !== undefined) {
-                    result.output = afterResult.modifiedResult;
-                }
+                    duration: toolDuration,
+                    sessionId: session.sessionId,
+                });
             }
-            // Emit tool:after event
-            const toolDuration = toolTimer.end();
-            this.eventBus.emit('tool:after', {
-                toolName: toolCall.name,
-                args: toolCall.input,
-                result: result.output,
-                duration: toolDuration,
-                sessionId: session.sessionId,
-            });
+            else {
+                this.eventBus.emit('tool:error', {
+                    toolName: toolCall.name,
+                    args: toolCall.input,
+                    error: result.error || result.output,
+                    sessionId: session.sessionId,
+                });
+            }
+            this.streamingHandler.emitToolEnd(toolCall.id, toolCall.name, result.success ? result.output : result.error || result.output, !result.success);
             // Record tool execution performance
             performanceMonitor.recordToolExecution(toolDuration);
             // Update approval record with execution result
@@ -2112,6 +2261,13 @@ If there's nothing noteworthy, respond with an empty string.`,
         catch (error) {
             toolTimer.end(); // ensure timer is stopped
             logger.error(`Tool execution failed for ${toolCall.name}:`, error);
+            this.eventBus.emit('tool:error', {
+                toolName: toolCall.name,
+                args: toolCall.input,
+                error,
+                sessionId: session.sessionId,
+            });
+            this.streamingHandler.emitToolEnd(toolCall.id, toolCall.name, error instanceof Error ? error.message : String(error), true);
             return {
                 success: false,
                 output: null,

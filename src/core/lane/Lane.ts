@@ -22,8 +22,20 @@ export class Lane extends EventEmitter {
     this.options = {
       concurrency: options.concurrency || 1, // Default to serial
       maxQueueSize: options.maxQueueSize || 100,
-      timeoutMs: options.timeoutMs || 300000, // 5 minutes
+      timeoutMs: options.timeoutMs ?? 0, // 0 = no timeout
     };
+  }
+
+  private getPriorityWeight(priority: Task['priority']): number {
+    switch (priority) {
+      case 'high':
+        return 3;
+      case 'normal':
+        return 2;
+      case 'low':
+      default:
+        return 1;
+    }
   }
 
   /**
@@ -35,8 +47,17 @@ export class Lane extends EventEmitter {
       throw new Error(`Lane ${this.id} queue is full`);
     }
 
-    // Add to queue
-    this.queue.push(task);
+    // Insert by priority while preserving FIFO order within the same priority.
+    const taskWeight = this.getPriorityWeight(task.priority);
+    const insertIndex = this.queue.findIndex(
+      (queuedTask) => this.getPriorityWeight(queuedTask.priority) < taskWeight
+    );
+
+    if (insertIndex === -1) {
+      this.queue.push(task);
+    } else {
+      this.queue.splice(insertIndex, 0, task);
+    }
     this.emit('task:queued', { taskId: task.id, queueLength: this.queue.length });
 
     logger.info(`[Lane:${this.id}] Task queued: ${task.name} (queue: ${this.queue.length})`);

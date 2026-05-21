@@ -7,6 +7,7 @@
  * Security Note: These tools execute arbitrary code. Use with caution.
  */
 import { z } from 'zod';
+import { runInNewContext } from 'node:vm';
 import { logger } from '../../utils/logger.js';
 /**
  * Code Execution Tool (Synchronous)
@@ -37,17 +38,13 @@ export const codeExecTool = {
         try {
             const { code, context = {} } = params;
             logger.debug(`[code_exec] Executing code (${code.length} chars)`);
-            // Inject context variables
-            const contextKeys = Object.keys(context);
-            const contextValues = Object.values(context);
-            // Use Function constructor (safer than direct eval)
-            const fn = new Function(...contextKeys, `
+            // Use vm.runInNewContext — Javet blocks new Function() / eval()
+            const result = runInNewContext(`
         "use strict";
-        return (function() {
+        (function() {
           ${code}
         })();
-      `);
-            const result = fn(...contextValues);
+      `, { ...context });
             logger.debug(`[code_exec] Execution successful`);
             return {
                 success: true,
@@ -101,16 +98,13 @@ export const codeExecAsyncTool = {
         try {
             const { code, context = {} } = params;
             logger.debug(`[code_exec_async] Executing async code (${code.length} chars)`);
-            const contextKeys = Object.keys(context);
-            const contextValues = Object.values(context);
-            // Create async function
-            const fn = new Function(...contextKeys, `
+            // Use vm.runInNewContext — Javet blocks new Function() / eval()
+            const result = await runInNewContext(`
         "use strict";
-        return (async function() {
+        (async function() {
           ${code}
         })();
-      `);
-            const result = await fn(...contextValues);
+      `, { ...context });
             logger.debug(`[code_exec_async] Execution successful`);
             return {
                 success: true,
@@ -170,22 +164,20 @@ export const codeExecSafeTool = {
         try {
             const { code, context = {}, timeout = 5000 } = params;
             logger.debug(`[code_exec_safe] Executing code with ${timeout}ms timeout`);
-            const contextKeys = Object.keys(context);
-            const contextValues = Object.values(context);
             // Create timeout promise
             const timeoutPromise = new Promise((_, reject) => {
                 setTimeout(() => reject(new Error(`Code execution timeout after ${timeout}ms`)), timeout);
             });
-            // Create execution promise
+            // Create execution promise using vm.runInNewContext
             const execPromise = new Promise((resolve, reject) => {
                 try {
-                    const fn = new Function(...contextKeys, `
+                    const result = runInNewContext(`
             "use strict";
-            return (async function() {
+            (async function() {
               ${code}
             })();
-          `);
-                    resolve(fn(...contextValues));
+          `, { ...context });
+                    resolve(result);
                 }
                 catch (error) {
                     reject(error);
@@ -262,15 +254,13 @@ export const codeExecWithLogsTool = {
             console.warn = (...args) => logs.push({ level: 'warn', args });
             console.error = (...args) => logs.push({ level: 'error', args });
             try {
-                const contextKeys = Object.keys(context);
-                const contextValues = Object.values(context);
-                const fn = new Function(...contextKeys, `
+                // Use vm.runInNewContext — Javet blocks new Function() / eval()
+                const result = runInNewContext(`
           "use strict";
-          return (function() {
+          (function() {
             ${code}
           })();
-        `);
-                const result = fn(...contextValues);
+        `, { ...context, console });
                 return {
                     success: true,
                     output: {

@@ -4,10 +4,12 @@
  * Adapter for Feishu/Lark using @larksuiteoapi/node-sdk
  * Install: npm install @larksuiteoapi/node-sdk
  */
+import { promises as fs } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
+import LarkSDK from '@larksuiteoapi/node-sdk';
 import { BaseSocialAdapter } from '../BaseSocialAdapter.js';
 import { logger } from '../../utils/logger.js';
-// @larksuiteoapi/node-sdk 是 CJS 包，不能用命名导入
-import LarkSDK from '@larksuiteoapi/node-sdk';
 const { Client, WSClient, AppType, Domain, EventDispatcher } = LarkSDK;
 /**
  * Feishu/Lark adapter
@@ -26,24 +28,23 @@ export class FeishuAdapter extends BaseSocialAdapter {
             throw new Error('Feishu app ID and app secret are required');
         }
         try {
-            // Create client instance
             this.client = new Client({
                 appId: this.config.appId,
                 appSecret: this.config.appSecret,
                 appType: AppType.SelfBuild,
                 domain: this.config.options?.domain || Domain.Feishu,
             });
-            // Create event dispatcher for handling callbacks
             this.eventDispatcher = new EventDispatcher({
                 encryptKey: this.config.options?.encryptKey,
             }).register({
                 'im.message.receive_v1': async (data) => {
                     await this.handleFeishuMessage(data);
                 },
+                'im.message.message_read_v1': async () => {
+                    // Ignore read receipts to avoid noisy SDK warnings.
+                },
             });
             logger.info(`[${this.platformName}] Connected to Feishu/Lark`);
-            // Start WebSocket long connection so Feishu server can push events to us
-            // (No public IP needed — the SDK connects outbound to Feishu's servers)
             this.wsClient = new WSClient(this.client);
             this.wsClient.start({ eventDispatcher: this.eventDispatcher });
             logger.info(`[${this.platformName}] WebSocket long connection started`);
@@ -60,7 +61,9 @@ export class FeishuAdapter extends BaseSocialAdapter {
         try {
             this.wsClient?.stop?.();
         }
-        catch { /* ignore */ }
+        catch {
+            // Ignore shutdown failures.
+        }
         this.wsClient = undefined;
         this.client = undefined;
         this.eventDispatcher = undefined;
@@ -72,44 +75,172 @@ export class FeishuAdapter extends BaseSocialAdapter {
         await this.sendMessageWithId(message);
     }
     /**
-     * Send message and return the message_id (enables streaming updates via editMessage)
+     * Send message and return the first emitted message_id.
+     * This keeps streaming placeholders working while still allowing
+     * text + image/file messages to be sent sequentially.
      */
     async sendMessageWithId(message) {
         if (!this.client) {
             throw new Error('Feishu client not initialized');
         }
         try {
-            // NOTE: receive_id_type is a query param, everything else is body (data).
-            // Passing a flat object causes 400 "receive_id_type is required".
-            const res = await this.client.im.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: {
-                    receive_id: message.chatId,
-                    msg_type: 'text',
-                    content: JSON.stringify({ text: message.text || '' }),
-                },
-            });
-            const messageId = res?.data?.message_id || '';
-            // Send attachments if any
+            let firstMessageId = '';
+            const text = message.text ?? '';
+            if (text.trim()) {
+                firstMessageId = await this.createMessage(message.chatId, 'text', {
+                    text,
+                });
+            }
             if (message.attachments?.length) {
                 for (const attachment of message.attachments) {
-                    await this.client.im.message.create({
-                        params: { receive_id_type: 'chat_id' },
-                        data: {
-                            receive_id: message.chatId,
-                            msg_type: attachment.type === 'image' ? 'image' : 'file',
-                            content: JSON.stringify({
-                                [attachment.type === 'image' ? 'image_key' : 'file_key']: attachment.url,
-                            }),
-                        },
-                    });
+                    const attachmentMessageId = await this.sendAttachmentMessage(message.chatId, attachment);
+                    if (!firstMessageId) {
+                        firstMessageId = attachmentMessageId;
+                    }
                 }
             }
-            return messageId;
+            return firstMessageId;
         }
         catch (error) {
             logger.error(`[${this.platformName}] Failed to send message:`, error);
             throw error;
+        }
+    }
+    async createMessage(chatId, msgType, content) {
+        if (!this.client) {
+            throw new Error('Feishu client not initialized');
+        }
+        const res = await this.client.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+                receive_id: chatId,
+                msg_type: msgType,
+                content: JSON.stringify(content),
+            },
+        });
+        return res?.data?.message_id || '';
+    }
+    async sendAttachmentMessage(chatId, attachment) {
+        if (attachment.type === 'image') {
+            const imageKey = await this.resolveImageKey(attachment);
+            return this.createMessage(chatId, 'image', { image_key: imageKey });
+        }
+        const fileKey = await this.resolveFileKey(attachment);
+        return this.createMessage(chatId, 'file', { file_key: fileKey });
+    }
+    async resolveImageKey(attachment) {
+        const source = this.getAttachmentSource(attachment);
+        if (!source) {
+            throw new Error('Feishu image attachment is missing a source');
+        }
+        if (!(await this.shouldUploadAttachment(source))) {
+            return source;
+        }
+        const image = await this.readAttachmentBytes(source);
+        const res = await this.client.im.image.create({
+            data: {
+                image_type: 'message',
+                image,
+            },
+        });
+        const imageKey = res?.image_key;
+        if (!imageKey) {
+            throw new Error(`Feishu image upload failed for ${source}`);
+        }
+        return imageKey;
+    }
+    async resolveFileKey(attachment) {
+        const source = this.getAttachmentSource(attachment);
+        if (!source) {
+            throw new Error('Feishu file attachment is missing a source');
+        }
+        if (!(await this.shouldUploadAttachment(source))) {
+            return source;
+        }
+        const file = await this.readAttachmentBytes(source);
+        const fileName = this.getAttachmentFilename(attachment, source);
+        const fileType = this.getAttachmentFileType(fileName);
+        const res = await this.client.im.file.create({
+            data: {
+                file_type: fileType,
+                file_name: fileName,
+                file,
+            },
+        });
+        const fileKey = res?.file_key;
+        if (!fileKey) {
+            throw new Error(`Feishu file upload failed for ${source}`);
+        }
+        return fileKey;
+    }
+    getAttachmentSource(attachment) {
+        return attachment.localPath?.trim() || attachment.url?.trim() || undefined;
+    }
+    getAttachmentFilename(attachment, source) {
+        if (attachment.filename?.trim()) {
+            return attachment.filename.trim();
+        }
+        if (this.isHttpUrl(source)) {
+            try {
+                const url = new URL(source);
+                const basename = path.posix.basename(url.pathname);
+                return basename || 'attachment';
+            }
+            catch {
+                return 'attachment';
+            }
+        }
+        return path.basename(source) || 'attachment';
+    }
+    getAttachmentFileType(fileName) {
+        return path.extname(fileName).replace(/^\./, '').toLowerCase() || 'file';
+    }
+    async shouldUploadAttachment(source) {
+        if (this.isHttpUrl(source)) {
+            return true;
+        }
+        if (await this.pathExists(source)) {
+            return true;
+        }
+        return this.looksLikeLocalPath(source);
+    }
+    looksLikeLocalPath(value) {
+        return (path.isAbsolute(value) ||
+            value.startsWith('./') ||
+            value.startsWith('.\\') ||
+            value.startsWith('../') ||
+            value.startsWith('..\\') ||
+            value.includes('/') ||
+            value.includes('\\') ||
+            Boolean(path.extname(value)));
+    }
+    async readAttachmentBytes(source) {
+        if (await this.pathExists(source)) {
+            return fs.readFile(source);
+        }
+        if (this.isHttpUrl(source)) {
+            const response = await fetch(source);
+            if (!response.ok) {
+                throw new Error(`Failed to download attachment from ${source}: HTTP ${response.status}`);
+            }
+            const arrayBuffer = await response.arrayBuffer();
+            return Buffer.from(arrayBuffer);
+        }
+        if (this.looksLikeLocalPath(source)) {
+            throw new Error(`Attachment file not found: ${source}`);
+        }
+        throw new Error(`Attachment source is not a local path or URL: ${source}`);
+    }
+    isHttpUrl(value) {
+        return /^https?:\/\//i.test(value);
+    }
+    async pathExists(value) {
+        try {
+            await fs.access(value);
+            return true;
+        }
+        catch {
+            return false;
         }
     }
     /**
@@ -188,8 +319,7 @@ export class FeishuAdapter extends BaseSocialAdapter {
     /**
      * Handle Feishu message event.
      * With WSClient long-connection mode the SDK passes the event payload directly,
-     * so `data` IS the event (structure: { sender, message }) — there is no outer
-     * `data.event` wrapper like in webhook mode.
+     * so `data` is the event (structure: { sender, message }).
      */
     async handleFeishuMessage(data) {
         try {
@@ -199,16 +329,32 @@ export class FeishuAdapter extends BaseSocialAdapter {
                 logger.warn(`[${this.platformName}] Unexpected event shape:`, JSON.stringify(data).slice(0, 200));
                 return;
             }
+            if (sender.sender_type && sender.sender_type !== 'user') {
+                logger.debug(`[${this.platformName}] Ignoring non-user event from sender_type=${sender.sender_type}`);
+                return;
+            }
+            const extracted = await this.extractIncomingPayload(msg);
             const message = {
                 messageId: msg.message_id,
                 chatId: msg.chat_id,
-                userId: sender.sender_id?.user_id || sender.sender_id?.open_id || sender.sender_id?.union_id || 'unknown',
+                userId: sender.sender_id?.user_id ||
+                    sender.sender_id?.open_id ||
+                    sender.sender_id?.union_id ||
+                    'unknown',
                 username: sender.sender_id?.user_id || sender.sender_id?.open_id || 'unknown',
-                text: this.extractTextContent(msg),
+                text: extracted.text,
                 timestamp: Number(msg.create_time),
                 platform: this.platformName,
                 replyTo: msg.parent_id,
+                attachments: extracted.attachments,
+                metadata: {
+                    messageType: msg.message_type,
+                },
             };
+            if (!message.text?.trim() && !message.attachments?.length) {
+                logger.debug(`[${this.platformName}] Ignoring empty Feishu message ${message.messageId}`);
+                return;
+            }
             await this.emitMessage(message);
         }
         catch (error) {
@@ -220,12 +366,147 @@ export class FeishuAdapter extends BaseSocialAdapter {
      */
     extractTextContent(message) {
         try {
-            const content = JSON.parse(message.content);
+            const content = this.parseMessageContent(message);
             return content.text || '';
         }
-        catch (error) {
+        catch {
             return '';
         }
+    }
+    parseMessageContent(message) {
+        try {
+            const rawContent = message?.content;
+            if (typeof rawContent !== 'string' || !rawContent.trim()) {
+                return {};
+            }
+            return JSON.parse(rawContent);
+        }
+        catch {
+            return {};
+        }
+    }
+    async extractIncomingPayload(message) {
+        const content = this.parseMessageContent(message);
+        switch (message?.message_type) {
+            case 'image': {
+                const imageKey = content.image_key;
+                if (!imageKey) {
+                    return { text: '' };
+                }
+                return {
+                    text: '',
+                    attachments: [
+                        await this.downloadMessageAttachment(message, imageKey, 'image', 'image', content.file_name),
+                    ],
+                };
+            }
+            case 'file': {
+                const fileKey = content.file_key;
+                if (!fileKey) {
+                    return { text: '' };
+                }
+                return {
+                    text: '',
+                    attachments: [
+                        await this.downloadMessageAttachment(message, fileKey, 'file', 'file', content.file_name),
+                    ],
+                };
+            }
+            default:
+                return {
+                    text: content.text || '',
+                };
+        }
+    }
+    async downloadMessageAttachment(message, resourceKey, resourceType, attachmentType, filenameHint) {
+        if (!this.client) {
+            throw new Error('Feishu client not initialized');
+        }
+        const resource = await this.client.im.messageResource.get({
+            params: { type: resourceType },
+            path: {
+                message_id: message.message_id,
+                file_key: resourceKey,
+            },
+        });
+        const mimeType = this.extractHeaderValue(resource?.headers, 'content-type') ||
+            this.defaultMimeTypeForAttachment(attachmentType, filenameHint);
+        const finalFilename = this.buildDownloadedFilename(message.message_id, attachmentType, filenameHint, mimeType);
+        const tempDir = path.join(tmpdir(), 'anode-clawdbot', 'feishu-media');
+        await fs.mkdir(tempDir, { recursive: true });
+        const localPath = path.join(tempDir, finalFilename);
+        if (typeof resource?.writeFile === 'function') {
+            await resource.writeFile(localPath);
+        }
+        else {
+            throw new Error('Feishu message resource download does not expose writeFile');
+        }
+        return {
+            type: attachmentType,
+            url: localPath,
+            localPath,
+            filename: finalFilename,
+            mimeType,
+        };
+    }
+    buildDownloadedFilename(messageId, attachmentType, filenameHint, mimeType) {
+        const hintedName = filenameHint?.trim()
+            ? path.basename(filenameHint.trim())
+            : `${attachmentType}-${messageId}`;
+        const parsed = path.parse(hintedName);
+        const safeBaseName = this.sanitizeFilename(parsed.name || `${attachmentType}-${messageId}`);
+        const extension = parsed.ext ||
+            this.extensionFromMimeType(mimeType) ||
+            this.defaultExtensionForAttachment(attachmentType);
+        return `${safeBaseName}-${Date.now()}${extension}`;
+    }
+    sanitizeFilename(value) {
+        return value.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_');
+    }
+    extractHeaderValue(headers, headerName) {
+        if (!headers) {
+            return undefined;
+        }
+        if (typeof headers.get === 'function') {
+            return headers.get(headerName) || headers.get(headerName.toLowerCase()) || undefined;
+        }
+        return (headers[headerName] ||
+            headers[headerName.toLowerCase()] ||
+            headers[headerName.toUpperCase()]);
+    }
+    defaultMimeTypeForAttachment(attachmentType, filenameHint) {
+        const extension = path.extname(filenameHint || '').replace(/^\./, '').toLowerCase();
+        if (extension === 'png')
+            return 'image/png';
+        if (extension === 'gif')
+            return 'image/gif';
+        if (extension === 'webp')
+            return 'image/webp';
+        if (extension === 'jpg' || extension === 'jpeg')
+            return 'image/jpeg';
+        if (attachmentType === 'image')
+            return 'image/png';
+        return 'application/octet-stream';
+    }
+    extensionFromMimeType(mimeType) {
+        switch (mimeType) {
+            case 'image/png':
+                return '.png';
+            case 'image/gif':
+                return '.gif';
+            case 'image/webp':
+                return '.webp';
+            case 'image/jpeg':
+                return '.jpg';
+            default:
+                return undefined;
+        }
+    }
+    defaultExtensionForAttachment(attachmentType) {
+        if (attachmentType === 'image') {
+            return '.png';
+        }
+        return '.bin';
     }
     /**
      * Get event dispatcher (for webhook setup)

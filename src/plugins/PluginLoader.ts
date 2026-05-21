@@ -25,6 +25,7 @@ export interface FileAPI {
 export class PluginLoader {
   private pluginDir: string;
   private fileAPI: FileAPI;
+  private readonly reservedDirectories = new Set(['builtin']);
 
   constructor(pluginDir: string, fileAPI: FileAPI) {
     this.pluginDir = pluginDir;
@@ -167,6 +168,18 @@ export class PluginLoader {
 
       // Load each plugin
       for (const dir of pluginDirs) {
+        if (this.reservedDirectories.has(dir.name)) {
+          logger.debug(`[PluginLoader] Skipping reserved directory: ${dir.name}`);
+          continue;
+        }
+
+        const metadataPath = `${this.pluginDir}/${dir.name}/plugin.json`;
+        const hasMetadata = await this.fileAPI.exists(metadataPath);
+        if (!hasMetadata) {
+          logger.debug(`[PluginLoader] Skipping non-plugin directory: ${dir.name}`);
+          continue;
+        }
+
         const result = await this.load(dir.name);
         results.set(dir.name, result);
 

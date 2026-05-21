@@ -9,6 +9,18 @@ import { z } from 'zod';
 import type { Tool, ToolResult, ToolExecutionOptions } from '../types.js';
 import { logger } from '../../utils/logger.js';
 
+// Anode http global for image generation API calls
+declare const http: {
+  httpPost(urlString: string, body?: any, headers?: Record<string, string>): Promise<any>;
+  httpGet(urlString: string, headers?: Record<string, string>): Promise<any>;
+};
+
+// Anode file global for saving downloaded images
+declare const file: {
+  writeBytes(path: string, bytes: Uint8Array): Promise<boolean>;
+  createDirectory(path: string): Promise<any>;
+};
+
 // Anode image global (based on anode-api.d.ts)
 declare const image: {
   loadImage(path: string): Promise<any>;
@@ -937,6 +949,277 @@ export const imageToBase64Tool: Tool = {
 };
 
 /**
+ * Generate Image Tool (Z-Image / DashScope text-to-image)
+ *
+ * Calls the Alibaba DashScope Z-Image API to generate an image from a text prompt.
+ * The generated image is downloaded and saved to the device.
+ * Requires DASHSCOPE_API_KEY in config (imageGeneration.apiKey).
+ */
+export const generateImageTool: Tool = {
+  name: 'generate_image',
+  description:
+    'Generate an image from a text prompt using the Z-Image AI model. ' +
+    'Supports Chinese and English text rendering, multiple aspect ratios. ' +
+    'Returns the local path to the generated PNG image.',
+  category: 'image',
+  permissions: ['network:http', 'file:write'],
+  parallelizable: true,
+
+  parameters: [
+    {
+      name: 'prompt',
+      description:
+        'Text prompt describing the image to generate (Chinese or English, max 800 chars)',
+      schema: z.string().min(1).max(800),
+      required: true,
+    },
+    {
+      name: 'size',
+      description:
+        'Output image resolution as "width*height". Total pixels must be in [512*512, 2048*2048]. ' +
+        'Recommended sizes: 1024*1024 (1:1), 1024*1536 (2:3), 1536*1024 (3:2), 1280*720 (16:9), 720*1280 (9:16). ' +
+        'Default: 1024*1536',
+      schema: z.string().regex(/^\d+\*\d+$/),
+      required: false,
+      default: '1024*1536',
+    },
+    {
+      name: 'outputPath',
+      description:
+        'Path to save the generated image. Default: ./data/generated/<timestamp>.png',
+      schema: z.string(),
+      required: false,
+    },
+    {
+      name: 'promptExtend',
+      description:
+        'Enable smart prompt rewriting using a large model. Improves results but costs more and is slower. Default: false',
+      schema: z.boolean(),
+      required: false,
+      default: false,
+    },
+    {
+      name: 'seed',
+      description:
+        'Random seed (0-2147483647) for reproducible results. Same seed produces similar (not identical) outputs.',
+      schema: z.number().int().min(0).max(2147483647),
+      required: false,
+    },
+  ],
+
+  async execute(params, options): Promise<ToolResult> {
+    try {
+      const {
+        prompt,
+        size = '1024*1536',
+        outputPath,
+        promptExtend = false,
+        seed,
+      } = params;
+
+      // Resolve API key from config or environment
+      const apiKey =
+        options?.config?.imageGeneration?.apiKey ||
+        (typeof process !== 'undefined' && process.env?.DASHSCOPE_API_KEY) ||
+        '';
+
+      if (!apiKey) {
+        return {
+          success: false,
+          error: {
+            code: 'MISSING_API_KEY',
+            message:
+              'DashScope API key not configured. Set imageGeneration.apiKey in config or DASHSCOPE_API_KEY environment variable.',
+          },
+        };
+      }
+
+      // Resolve API endpoint
+      const baseURL =
+        options?.config?.imageGeneration?.baseURL ||
+        'https://dashscope.aliyuncs.com';
+      const apiURL = `${baseURL}/api/v1/services/aigc/multimodal-generation/generation`;
+
+      // Validate size: total pixels in [512*512, 2048*2048]
+      const [w, h] = size.split('*').map(Number);
+      const totalPixels = w * h;
+      if (totalPixels < 512 * 512 || totalPixels > 2048 * 2048) {
+        return {
+          success: false,
+          error: {
+            code: 'INVALID_SIZE',
+            message: `Total pixels (${w}x${h}=${totalPixels}) must be in [${512 * 512}, ${2048 * 2048}]`,
+          },
+        };
+      }
+
+      logger.info(`Generating image: prompt="${prompt.substring(0, 50)}...", size=${size}`);
+
+      // Build request body
+      const requestBody: any = {
+        model: options?.config?.imageGeneration?.model || 'z-image-turbo',
+        input: {
+          messages: [
+            {
+              role: 'user',
+              content: [{ text: prompt }],
+            },
+          ],
+        },
+        parameters: {
+          size,
+          prompt_extend: promptExtend,
+        },
+      };
+
+      if (seed !== undefined) {
+        requestBody.parameters.seed = seed;
+      }
+
+      // Call Z-Image API
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      };
+
+      const response = await http.httpPost(apiURL, JSON.stringify(requestBody), headers);
+
+      // Parse response
+      let responseData: any;
+      if (typeof response === 'string') {
+        responseData = JSON.parse(response);
+      } else if (response?.body && typeof response.body === 'string') {
+        responseData = JSON.parse(response.body);
+      } else {
+        responseData = response;
+      }
+
+      // Check for API error
+      if (responseData.code) {
+        return {
+          success: false,
+          error: {
+            code: responseData.code,
+            message: responseData.message || 'Z-Image API error',
+            details: responseData,
+          },
+        };
+      }
+
+      // Extract image URL from response
+      const choices = responseData.output?.choices;
+      if (!choices || choices.length === 0) {
+        return {
+          success: false,
+          error: {
+            code: 'NO_IMAGE_GENERATED',
+            message: 'API returned no image in response',
+            details: responseData,
+          },
+        };
+      }
+
+      const content = choices[0]?.message?.content;
+      const imageUrl = content?.find((c: any) => c.image)?.image;
+      const returnedText = content?.find((c: any) => c.text)?.text;
+      const reasoningContent = choices[0]?.message?.reasoning_content;
+
+      if (!imageUrl) {
+        return {
+          success: false,
+          error: {
+            code: 'NO_IMAGE_URL',
+            message: 'API response did not contain an image URL',
+            details: responseData,
+          },
+        };
+      }
+
+      // Determine output path
+      const savePath =
+        outputPath || `./data/generated/${Date.now()}.png`;
+
+      // Ensure output directory exists
+      const dirPath = savePath.substring(0, savePath.lastIndexOf('/'));
+      if (dirPath) {
+        await file.createDirectory(dirPath);
+      }
+
+      // Download the image
+      logger.debug(`Downloading generated image from: ${imageUrl}`);
+      const imageResponse = await http.httpGet(imageUrl);
+
+      // Save image bytes
+      let saved = false;
+      if (imageResponse instanceof Uint8Array) {
+        saved = await file.writeBytes(savePath, imageResponse);
+      } else if (imageResponse?.bytes instanceof Uint8Array) {
+        saved = await file.writeBytes(savePath, imageResponse.bytes);
+      } else {
+        // Fallback: use Anode image API to load from URL and save
+        const bitmap = await image.loadImage(imageUrl);
+        if (bitmap) {
+          saved = await image.saveImage(bitmap, savePath, 'png', 100);
+        }
+      }
+
+      if (!saved) {
+        return {
+          success: false,
+          error: {
+            code: 'SAVE_FAILED',
+            message: `Failed to save generated image to ${savePath}. Image URL (valid 24h): ${imageUrl}`,
+          },
+        };
+      }
+
+      logger.info(`Image generated and saved to: ${savePath}`);
+
+      const result: ToolResult = {
+        success: true,
+        output: {
+          action: 'generate_image',
+          savedPath: savePath,
+          imageUrl,
+          size,
+          prompt: prompt.substring(0, 100) + (prompt.length > 100 ? '...' : ''),
+          promptExtend,
+          usage: responseData.usage,
+          message: `Image generated and saved to ${savePath}`,
+        },
+        attachments: [
+          {
+            type: 'image',
+            localPath: savePath,
+            mimeType: 'image/png',
+          },
+        ],
+      };
+
+      // Include rewritten prompt and reasoning if prompt_extend was on
+      if (promptExtend && returnedText) {
+        result.output.rewrittenPrompt = returnedText;
+      }
+      if (promptExtend && reasoningContent) {
+        result.output.reasoning = reasoningContent;
+      }
+
+      return result;
+    } catch (error) {
+      return {
+        success: false,
+        error: {
+          code: 'GENERATE_IMAGE_FAILED',
+          message:
+            error instanceof Error ? error.message : 'Failed to generate image',
+          details: error,
+        },
+      };
+    }
+  },
+};
+
+/**
  * All image tools
  */
 export const imageTools: Tool[] = [
@@ -951,4 +1234,5 @@ export const imageTools: Tool[] = [
   gaussianBlurTool,
   edgeDetectionTool,
   imageToBase64Tool,
+  generateImageTool,
 ];

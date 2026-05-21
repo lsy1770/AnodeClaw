@@ -28,6 +28,16 @@ declare const file: {
 };
 
 /**
+ * Extract error message from any thrown value (JS Error, Javet/Java exception, string, etc.)
+ */
+function extractErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object' && 'message' in error) return String((error as any).message);
+  if (typeof error === 'string') return error;
+  try { return String(error); } catch { return fallback; }
+}
+
+/**
  * Serialize body to JSON string for Kotlin interop.
  * Kotlin's toJsonString() extension only handles Map/List — a Javet V8ValueObject
  * is neither, so .toString() produces garbage. Always stringify on the JS side.
@@ -86,7 +96,7 @@ export const httpGetTool: Tool = {
         success: false,
         error: {
           code: 'REQUEST_FAILED',
-          message: error instanceof Error ? error.message : 'HTTP GET request failed',
+          message: extractErrorMessage(error, 'HTTP GET request failed'),
           details: error,
         },
       };
@@ -152,7 +162,7 @@ export const httpPostTool: Tool = {
         success: false,
         error: {
           code: 'REQUEST_FAILED',
-          message: error instanceof Error ? error.message : 'HTTP POST request failed',
+          message: extractErrorMessage(error, 'HTTP POST request failed'),
           details: error,
         },
       };
@@ -188,13 +198,13 @@ export const httpRequestTool: Tool = {
     {
       name: 'headers',
       description: 'HTTP headers as key-value object',
-      schema: z.record(z.string()).optional().nullable(),
+      schema: z.record(z.coerce.string()),
       required: false,
     },
     {
       name: 'body',
       description: 'Request body (for POST/PUT/PATCH)',
-      schema: z.union([z.string(), z.record(z.any())]).optional().nullable(),
+      schema: z.union([z.string(), z.record(z.any())]),
       required: false,
     },
     {
@@ -282,11 +292,12 @@ export const httpRequestTool: Tool = {
         },
       };
     } catch (error) {
+      logger.error(`[http_request] Failed:`, error);
       return {
         success: false,
         error: {
           code: 'REQUEST_FAILED',
-          message: error instanceof Error ? error.message : 'HTTP request failed',
+          message: extractErrorMessage(error, 'HTTP request failed'),
           details: error,
         },
       };
@@ -325,7 +336,7 @@ export const checkNetworkTool: Tool = {
         success: false,
         error: {
           code: 'NETWORK_CHECK_FAILED',
-          message: error instanceof Error ? error.message : 'Failed to check network status',
+          message: extractErrorMessage(error, 'Failed to check network status'),
           details: error,
         },
       };
@@ -372,7 +383,7 @@ export const checkUrlTool: Tool = {
         success: false,
         error: {
           code: 'URL_CHECK_FAILED',
-          message: error instanceof Error ? error.message : 'Failed to check URL',
+          message: extractErrorMessage(error, 'Failed to check URL'),
           details: error,
         },
       };
@@ -449,7 +460,7 @@ export const uploadFileTool: Tool = {
         success: false,
         error: {
           code: 'UPLOAD_FAILED',
-          message: error instanceof Error ? error.message : 'File upload failed',
+          message: extractErrorMessage(error, 'File upload failed'),
           details: error,
         },
       };
@@ -553,7 +564,7 @@ export const downloadFileTool: Tool = {
         success: false,
         error: {
           code: 'DOWNLOAD_FAILED',
-          message: error instanceof Error ? error.message : 'Download failed',
+          message: extractErrorMessage(error, 'Download failed'),
           details: error,
         },
       };

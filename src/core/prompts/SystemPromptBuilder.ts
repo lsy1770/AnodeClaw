@@ -138,6 +138,7 @@ export class SystemPromptBuilder {
 - Prefer parallel tool calls for independent operations
 - Check tool results before proceeding to the next step
 - On tool failure, report the error and try an alternative approach
+- When a tool result includes attachments (images/files), treat them as real output artifacts. If the tool succeeded, acknowledge them as sent/attached on media-capable hosts instead of claiming the conversation is text-only.
 - Use \`code_exec_async\` to access Anode globals (auto, device, file, net, etc.)
 - Use sub-agents (\`create_subagent\` / \`delegate_subagent_task\`) only for genuinely parallel or specialized workloads`;
   }

@@ -24,7 +24,7 @@
 - `android_swipe` — 滑动手势 (startX, startY, endX, endY, duration)
 
 **高级手势：**
-- `android_gesture` — 沿路径执行手势 (duration, points[])
+- `android_gesture` — 沿路径执行手势 (duration, points[]，推荐 `[{x, y}, ...]`)
 - `android_gestures` — 同时执行多笔划手势 (strokes[])
 
 **元素查找：**

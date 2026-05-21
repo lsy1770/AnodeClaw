@@ -1,21 +1,8 @@
-/**
- * Proactive Behavior — AI-Driven Environmental Intelligence
+﻿/**
+ * Proactive Behavior - AI-driven environmental intelligence.
  *
- * The agent actively perceives its Android environment and synthesizes
- * everything with the AI model to decide what's worth telling the user.
- *
- * Sensor pipeline (runs every N minutes):
- *   Screen OCR → Notifications → Device state → Task state → Memories
- *             ↓ (all fed into one prompt)
- *         AI analysis
- *             ↓
- *   Inject into chat / system notification
- *
- * Design principles:
- * - AI does the heavy lifting — no hand-coded heuristics for "what matters"
- * - Screen content is read via OCR (PP-OCRv3, silent capture)
- * - Only trigger AI call when something has actually changed
- * - Prevent spam via per-topic cooldowns and minimum intervals
+ * The assistant periodically inspects device context and only surfaces
+ * proactive reminders when there is a concrete, actionable reason.
  */
 
 import { EventEmitter } from 'events';
@@ -23,17 +10,14 @@ import { logger } from '../../utils/logger.js';
 import type { MemoryStore } from '../memory/MemoryStore.js';
 import type { HeartbeatTaskConfig } from '../heartbeat/types.js';
 
-// ─── Anode API declarations ──────────────────────────────────────────────────
-
 declare const image: {
-  /** Silent screen capture via Accessibility Service (preferred, no permission UI) */
   captureScreenWithAccessibility(displayId?: number, timeoutMs?: number): Promise<any>;
+  isAccessibilityScreenshotSupported?(): Promise<boolean>;
 };
 
 declare const ocr: {
   init(): Promise<boolean>;
   isInitialized(): boolean;
-  /** Recognize text from bitmap. confidence: 0-1 threshold (default 0.5) */
   recognizeText(bitmap: any, confidence?: number): Promise<string>;
 };
 
@@ -54,12 +38,9 @@ declare const notificationListener: {
 
 declare const device: {
   getBatteryInfo(): Promise<{ level: number; isCharging: boolean }>;
-  isScreenOn(): boolean; // sync
+  isScreenOn(): boolean;
 };
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-/** Legacy-compatible suggestion type (also emitted by the new engine) */
 export interface ProactiveSuggestion {
   type: 'follow-up' | 'optimization' | 'warning' | 'reminder' | 'insight' | 'notification';
   title: string;
@@ -72,29 +53,20 @@ export type AIInsightGenerator = (context: string) => Promise<string | null>;
 
 export interface ProactiveBehaviorConfig {
   enabled: boolean;
-  /** Normal check interval (ms). Default: 15 min */
   checkInterval: number;
-  /** Fast check interval for time-sensitive events (ms). Default: 3 min */
   fastCheckInterval: number;
-  quietHoursStart: number;   // 0-23
-  quietHoursEnd: number;     // 0-23
+  quietHoursStart: number;
+  quietHoursEnd: number;
   repeatThreshold: number;
   idleSessionTimeout: number;
-  /** Minimum ms between AI synthesis calls to control cost. Default: 5 min */
   minAIInterval: number;
-  /** Battery alert threshold (%). Default: 20 */
   batteryThreshold: number;
-  /**
-   * Package names whose notifications trigger proactive attention.
-   * Set to [] to disable notification sensing.
-   */
   watchedPackages: string[];
-  /** Max OCR text chars to pass to AI (trim to keep prompt concise). Default: 800 */
   maxScreenTextChars: number;
 }
 
 interface EnvironmentSnapshot {
-  screenText: string;       // OCR result from current screen
+  screenText: string;
   screenOn: boolean;
   notifications: Array<{ app: string; title: string; body: string; key: string; time: number }>;
   battery: { level: number; isCharging: boolean } | null;
@@ -105,12 +77,12 @@ interface EnvironmentSnapshot {
 }
 
 const DEFAULT_WATCHED_PACKAGES = [
-  'com.tencent.mm',           // WeChat
-  'com.tencent.mobileqq',     // QQ
-  'org.telegram.messenger',   // Telegram
-  'com.whatsapp',             // WhatsApp
-  'com.android.mms',          // SMS
-  'com.android.phone',        // Phone
+  'com.tencent.mm',
+  'com.tencent.mobileqq',
+  'org.telegram.messenger',
+  'com.whatsapp',
+  'com.android.mms',
+  'com.android.phone',
 ];
 
 const DEFAULT_CONFIG: ProactiveBehaviorConfig = {
@@ -127,25 +99,23 @@ const DEFAULT_CONFIG: ProactiveBehaviorConfig = {
   maxScreenTextChars: 800,
 };
 
-// ─── Class ───────────────────────────────────────────────────────────────────
-
 export class ProactiveBehavior extends EventEmitter {
   private config: ProactiveBehaviorConfig;
   private memoryStore: MemoryStore;
   private getActiveSessions: () => string[];
-
-  // AI generator provided by AgentManager
   private aiGenerator: AIInsightGenerator | null = null;
 
-  // Dedup state
   private seenNotificationKeys: Set<string> = new Set();
-  private lastScreenHash: string = '';
-  private lastAICallTime: number = 0;
-  private lastBatteryAlertLevel: number = 100;
+  private lastScreenHash = '';
+  private lastAICallTime = 0;
+  private lastBatteryAlertLevel = 100;
+  private lastDeliveredAt = 0;
+  private accessibilityScreenshotSupported: boolean | null = null;
+  private loggedAccessibilityScreenshotUnsupported = false;
 
-  // Per-topic cooldown to prevent repeated identical messages
   private recentMessages: Map<string, number> = new Map();
-  private readonly MESSAGE_COOLDOWN = 30 * 60 * 1000; // 30 min
+  private readonly MESSAGE_COOLDOWN = 2 * 60 * 60 * 1000;
+  private readonly MIN_DELIVERY_INTERVAL = 30 * 60 * 1000;
 
   constructor(
     config: Partial<ProactiveBehaviorConfig> | undefined,
@@ -163,12 +133,6 @@ export class ProactiveBehavior extends EventEmitter {
     logger.info('[Proactive] AI generator registered');
   }
 
-  // ─── Public API ──────────────────────────────────────────────────────────
-
-  /**
-   * Fast sensor check (every 3 min).
-   * Gathers environment, runs AI synthesis if something changed.
-   */
   async fastCheck(): Promise<void> {
     if (!this.config.enabled || this.isQuietHours()) return;
     try {
@@ -179,15 +143,11 @@ export class ProactiveBehavior extends EventEmitter {
     }
   }
 
-  /**
-   * Full check (every 15 min) — same as fast but always includes memory analysis
-   * even if screen hasn't changed.
-   */
   async check(): Promise<ProactiveSuggestion[]> {
     if (!this.config.enabled || this.isQuietHours()) return [];
     try {
       const snap = await this.gatherSnapshot();
-      const msg = await this.synthesizeAndDeliver(snap, /* forceAI */ true);
+      const msg = await this.synthesizeAndDeliver(snap, true);
       if (!msg) return [];
       return [{
         type: 'insight',
@@ -202,24 +162,28 @@ export class ProactiveBehavior extends EventEmitter {
     }
   }
 
-  /**
-   * After task completion — quick AI summary based on what happened.
-   */
   async analyzeTaskCompletion(task: string, result: 'success' | 'failure'): Promise<ProactiveSuggestion[]> {
     if (!this.config.enabled) return [];
 
-    const prompt =
-      `## 任务完成通知\n` +
-      `任务："${task.slice(0, 100)}"\n` +
-      `结果：${result === 'success' ? '✅ 成功' : '❌ 失败'}\n\n` +
-      `请用一句话告知用户任务结果，并根据结果给出下一步建议（如果失败，建议排查方向）。` +
-      `如果结果对用户没有实际价值，回复 NO_MESSAGE。`;
+    const prompt = [
+      'You are deciding whether a background follow-up is actually useful to the user.',
+      `Task summary: ${task.slice(0, 120)}`,
+      `Result: ${result}`,
+      '',
+      'Rules:',
+      '- Only respond if there is a concrete next step, risk, or outcome worth notifying.',
+      '- Do not send praise, filler, or generic encouragement.',
+      '- If the result is routine and does not need user attention, reply exactly NO_MESSAGE.',
+      '- If you do reply, output exactly one concise Chinese sentence under 50 characters.',
+      '- Focus on the next action or specific outcome.',
+    ].join('\n');
 
     const msg = await this.callAI(prompt);
     if (!msg) return [];
+
     const suggestion: ProactiveSuggestion = {
       type: result === 'success' ? 'follow-up' : 'warning',
-      title: result === 'success' ? '任务完成' : '任务失败',
+      title: '主动提醒',
       description: msg,
       priority: result === 'success' ? 'low' : 'medium',
       timestamp: Date.now(),
@@ -227,8 +191,6 @@ export class ProactiveBehavior extends EventEmitter {
     this.emit('suggestions', [suggestion]);
     return [suggestion];
   }
-
-  // ─── Heartbeat factories ─────────────────────────────────────────────────
 
   createHeartbeatTask(): HeartbeatTaskConfig {
     return {
@@ -254,11 +216,59 @@ export class ProactiveBehavior extends EventEmitter {
     };
   }
 
-  // ─── Core: gather → synthesize → deliver ─────────────────────────────────
+  private hasActionableScreenSignal(text: string): boolean {
+    const normalized = text.trim();
+    if (!normalized) return false;
 
-  /**
-   * Collect all sensors in parallel.
-   */
+    return [
+      /验证码|verification code|auth code|otp|code[:：]?\s*\d{4,8}/i,
+      /登录|login|支付|payment|确认|confirm|授权|permission/i,
+      /错误|失败|异常|error|failed|warning|risk/i,
+      /会议|meeting|日程|calendar|提醒|deadline|due/i,
+      /快递|外卖|航班|train|delivery|arriv/i,
+    ].some((pattern) => pattern.test(normalized));
+  }
+
+  private hasMeaningfulContext(snap: EnvironmentSnapshot): boolean {
+    return Boolean(
+      snap.taskSummary ||
+      snap.taskNextSteps.length > 0 ||
+      snap.recentMemories.length > 0 ||
+      this.hasActionableScreenSignal(snap.screenText)
+    );
+  }
+
+  private normalizeSuggestionMessage(message: string): string {
+    return message
+      .replace(/^[>#*`\s]+/g, '')
+      .replace(/\s+/g, ' ')
+
+      .trim();
+  }
+
+  private buildMessageKey(message: string): string {
+    return this.normalizeSuggestionMessage(message)
+      .toLowerCase()
+      .replace(/[0-9]+/g, '#')
+      .replace(/[^\p{L}\p{N}#]+/gu, '')
+      .slice(0, 80);
+  }
+
+  private isLowValueMessage(message: string): boolean {
+    const normalized = this.normalizeSuggestionMessage(message);
+    if (!normalized || normalized.length < 8) {
+      return true;
+    }
+
+    return [
+      /^(如果需要|需要我|你可以随时|有需要的话)/,
+      /^(看起来|目前|现在)(你)?(可以|适合|建议)/,
+      /^(记得|别忘了)(保持|留意|关注)/,
+      /^(好的|收到|明白了|知道了)$/,
+      /(保持专注|继续加油|注意休息)/,
+    ].some((pattern) => pattern.test(normalized));
+  }
+
   private async gatherSnapshot(): Promise<EnvironmentSnapshot> {
     const [screenResult, notifResult, batteryResult, taskResult, memResult] = await Promise.allSettled([
       this.captureScreenText(),
@@ -274,17 +284,15 @@ export class ProactiveBehavior extends EventEmitter {
     const task = taskResult.status === 'fulfilled' ? taskResult.value : null;
     const mems = memResult.status === 'fulfilled' ? memResult.value : [];
 
-    // Sync the seen-notification set: remove dismissed ones
-    const currentKeys = new Set(rawNotifs.map(n => n.key));
-    for (const k of this.seenNotificationKeys) {
-      if (!currentKeys.has(k)) this.seenNotificationKeys.delete(k);
+    const currentKeys = new Set(rawNotifs.map((n) => n.key));
+    for (const key of this.seenNotificationKeys) {
+      if (!currentKeys.has(key)) this.seenNotificationKeys.delete(key);
     }
 
-    // Only surface NEW notifications
-    const newNotifs = rawNotifs.filter(n => !this.seenNotificationKeys.has(n.key));
-    for (const n of newNotifs) this.seenNotificationKeys.add(n.key);
+    const newNotifs = rawNotifs.filter((n) => !this.seenNotificationKeys.has(n.key));
+    for (const notif of newNotifs) this.seenNotificationKeys.add(notif.key);
 
-    const notifications = newNotifs.map(n => ({
+    const notifications = newNotifs.map((n) => ({
       app: n.appName || n.packageName.split('.').pop() || n.packageName,
       title: n.title ?? '',
       body: (n.text ?? n.subText ?? '').slice(0, 100),
@@ -293,7 +301,11 @@ export class ProactiveBehavior extends EventEmitter {
     }));
 
     let screenOn = true;
-    try { if (typeof device !== 'undefined') screenOn = device.isScreenOn(); } catch { /* ignore */ }
+    try {
+      if (typeof device !== 'undefined') screenOn = device.isScreenOn();
+    } catch {
+      // ignore device read failures
+    }
 
     return {
       screenText,
@@ -302,7 +314,7 @@ export class ProactiveBehavior extends EventEmitter {
       battery,
       taskSummary: task?.taskSummary ?? null,
       taskNextSteps: task?.nextSteps ?? [],
-      recentMemories: mems.map(r => ({
+      recentMemories: mems.map((r) => ({
         title: r.entry.title,
         snippet: r.entry.content.slice(0, 120),
       })),
@@ -310,150 +322,209 @@ export class ProactiveBehavior extends EventEmitter {
     };
   }
 
-  /**
-   * Decide whether to run AI, build prompt, call AI, deliver result.
-   * Returns the message delivered (or null).
-   */
   private async synthesizeAndDeliver(
     snap: EnvironmentSnapshot,
     forceAI = false,
   ): Promise<string | null> {
     if (!this.aiGenerator) return null;
 
-    // Determine if something changed since last check
     const screenHash = snap.screenText.slice(0, 200);
     const hasNewNotifs = snap.notifications.length > 0;
     const screenChanged = screenHash !== this.lastScreenHash;
-    const hasLowBattery = snap.battery && !snap.battery.isCharging
-      && snap.battery.level < this.config.batteryThreshold
-      && snap.battery.level <= this.lastBatteryAlertLevel - 5;
+    const hasLowBattery = Boolean(
+      snap.battery &&
+      !snap.battery.isCharging &&
+      snap.battery.level < this.config.batteryThreshold &&
+      snap.battery.level <= this.lastBatteryAlertLevel - 5
+    );
 
     if (hasLowBattery && snap.battery) {
       this.lastBatteryAlertLevel = snap.battery.level;
     }
 
-    const somethingChanged = hasNewNotifs || screenChanged || hasLowBattery || forceAI;
+    const actionableScreen = screenChanged && this.hasActionableScreenSignal(snap.screenText);
+    const meaningfulContext = this.hasMeaningfulContext(snap);
+    const somethingChanged = hasNewNotifs || actionableScreen || hasLowBattery || (forceAI && meaningfulContext);
     if (!somethingChanged) {
-      logger.debug('[Proactive] Nothing changed, skipping AI call');
+      logger.debug('[Proactive] Nothing actionable changed, skipping AI call');
       return null;
     }
 
-    // Rate-limit AI calls
     const now = Date.now();
     if (now - this.lastAICallTime < this.config.minAIInterval && !forceAI) {
       logger.debug('[Proactive] AI rate-limited');
       return null;
     }
 
+    const priority: ProactiveSuggestion['priority'] = hasNewNotifs || hasLowBattery || actionableScreen
+      ? 'high'
+      : 'medium';
+
+    if (priority !== 'high' && now - this.lastDeliveredAt < this.MIN_DELIVERY_INTERVAL) {
+      logger.debug('[Proactive] Delivery interval suppressing non-urgent suggestion');
+      return null;
+    }
+
     this.lastScreenHash = screenHash;
 
     const prompt = this.buildPrompt(snap);
-    const msg = await this.callAI(prompt);
+    const rawMessage = await this.callAI(prompt);
+    if (!rawMessage) return null;
 
-    if (!msg) return null;
-
-    // Dedup: don't send nearly identical messages within cooldown
-    const msgKey = msg.slice(0, 60);
-    if (this.recentMessages.has(msgKey)) {
-      const lastSent = this.recentMessages.get(msgKey)!;
-      if (now - lastSent < this.MESSAGE_COOLDOWN) {
-        logger.debug('[Proactive] Duplicate message suppressed');
-        return null;
-      }
+    const message = this.normalizeSuggestionMessage(rawMessage);
+    if (this.isLowValueMessage(message)) {
+      logger.debug('[Proactive] Low-value message suppressed');
+      return null;
     }
+
+    const msgKey = this.buildMessageKey(message);
+    const lastSent = this.recentMessages.get(msgKey);
+    if (lastSent && now - lastSent < this.MESSAGE_COOLDOWN) {
+      logger.debug('[Proactive] Duplicate message suppressed');
+      return null;
+    }
+
     this.recentMessages.set(msgKey, now);
-
-    // Clean expired cooldowns
-    for (const [k, t] of this.recentMessages) {
-      if (now - t > this.MESSAGE_COOLDOWN) this.recentMessages.delete(k);
+    for (const [key, timestamp] of this.recentMessages) {
+      if (now - timestamp > this.MESSAGE_COOLDOWN) this.recentMessages.delete(key);
     }
 
-    // Deliver
-    this.emit('proactiveMessage', msg);
+    this.lastDeliveredAt = now;
+
+    this.emit('proactiveMessage', message);
     this.emit('suggestions', [{
       type: 'insight',
       title: '主动提醒',
-      description: msg,
-      priority: hasNewNotifs || hasLowBattery ? 'high' : 'medium',
+      description: message,
+      priority,
       timestamp: now,
     }] satisfies ProactiveSuggestion[]);
 
     logger.info('[Proactive] Delivered proactive message');
-    return msg;
+    return message;
   }
-
-  // ─── Prompt builder ───────────────────────────────────────────────────────
 
   private buildPrompt(snap: EnvironmentSnapshot): string {
     const sections: string[] = [];
 
-    sections.push(
-      '你是用户Android手机上的智能助手，正在后台主动感知设备环境。\n' +
-      '请根据以下实时信息，判断是否有需要主动告知用户的内容。\n' +
-      '**重要规则**：只在有真正有用、用户希望知道的信息时才发送消息；如无必要，回复 NO_MESSAGE。\n'
-    );
+    sections.push([
+      'You are a background assistant on the user\'s Android device.',
+      'Decide whether there is something genuinely worth interrupting the user about.',
+      'Reply with exactly NO_MESSAGE unless there is a concrete, time-sensitive, actionable suggestion.',
+      'Never send generic productivity tips, motivation, greetings, or repeated reminders.',
+      'If you do send a message, output exactly one concise Chinese sentence under 50 characters.',
+      'The sentence must include a concrete action, object, or reason.',
+    ].join('\n'));
 
-    // Screen
     if (snap.screenOn && snap.screenText.trim()) {
-      const text = snap.screenText.slice(0, this.config.maxScreenTextChars);
-      sections.push(`## 当前屏幕内容（OCR）\n${text}`);
+      sections.push(`## Current screen (OCR)\n${snap.screenText.slice(0, this.config.maxScreenTextChars)}`);
     } else if (!snap.screenOn) {
-      sections.push('## 当前屏幕\n屏幕已关闭（息屏状态）');
+      sections.push('## Current screen\nScreen is off');
     }
 
-    // Notifications
     if (snap.notifications.length > 0) {
-      const lines = snap.notifications.slice(0, 5).map(n =>
-        `• [${n.app}]${n.title ? ` ${n.title}：` : ' '}${n.body}`
+      const lines = snap.notifications.slice(0, 5).map((n) =>
+        `- [${n.app}] ${n.title || '(no title)'} ${n.body}`.trim()
       );
-      if (snap.notifications.length > 5) lines.push(`  …及其他 ${snap.notifications.length - 5} 条`);
-      sections.push(`## 新收到的消息通知\n${lines.join('\n')}`);
+      if (snap.notifications.length > 5) {
+        lines.push(`- ...and ${snap.notifications.length - 5} more notifications`);
+      }
+      sections.push(`## New notifications\n${lines.join('\n')}`);
     }
 
-    // Battery
     if (snap.battery) {
-      const status = snap.battery.isCharging ? '充电中' : '未充电';
-      sections.push(`## 设备状态\n电量：${snap.battery.level}%（${status}）`);
+      sections.push(`## Device state\nBattery: ${snap.battery.level}%\nCharging: ${snap.battery.isCharging ? 'yes' : 'no'}`);
     }
 
-    // Current task
     if (snap.taskSummary) {
-      const steps = snap.taskNextSteps.length > 0
-        ? `\n待处理：${snap.taskNextSteps.slice(0, 3).join('、')}`
+      const nextSteps = snap.taskNextSteps.length > 0
+        ? `\nNext steps: ${snap.taskNextSteps.slice(0, 3).join(' | ')}`
         : '';
-      sections.push(`## 当前任务\n${snap.taskSummary.slice(0, 200)}${steps}`);
+      sections.push(`## Active task\n${snap.taskSummary.slice(0, 200)}${nextSteps}`);
     }
 
-    // Recent memories
     if (snap.recentMemories.length > 0) {
-      const lines = snap.recentMemories.map(m => `• ${m.title}：${m.snippet}`);
-      sections.push(`## 近期记忆摘要\n${lines.join('\n')}`);
+      const lines = snap.recentMemories.map((m) => `- ${m.title}: ${m.snippet}`);
+      sections.push(`## Recent memories\n${lines.join('\n')}`);
     }
 
-    sections.push(
-      '---\n' +
-      '## 分析要点\n' +
-      '请综合以上信息，考虑以下几类情况：\n' +
-      '1. **消息回复**：有未读消息需要用户关注或回复？\n' +
-      '2. **屏幕内容**：屏幕上有验证码、弹窗、需要操作的内容？\n' +
-      '3. **任务进展**：当前任务有可以继续的步骤，或需要总结的进展？\n' +
-      '4. **设备状态**：低电量或其他需要用户注意的设备状态？\n' +
-      '5. **主动建议**：根据用户的历史习惯和当前情境，有什么实用的主动建议？\n\n' +
-      '如果有值得通知的内容，请输出一条**简洁、直接、有行动建议**的中文消息（不超过150字）。\n' +
-      '消息要像一个贴心助手说话的语气，而不是系统通知。\n' +
-      '如果没有值得通知的内容，只输出：NO_MESSAGE'
-    );
+    sections.push([
+      'Only interrupt for cases like:',
+      '1. A message likely needs a timely reply.',
+      '2. The screen shows a verification code, confirmation, failure, or blocked step.',
+      '3. A task has a clear next step the user may forget.',
+      '4. Battery is low and may affect an ongoing task.',
+      '',
+      'Suppress messages for cases like:',
+      '- vague observations',
+      '- repeated reminders',
+      '- generic "I can help" statements',
+      '- advice without a clear action',
+      '',
+      'Output exactly one line: either NO_MESSAGE or the Chinese reminder.',
+    ].join('\n'));
 
     return sections.join('\n\n');
   }
 
-  // ─── Sensors ──────────────────────────────────────────────────────────────
+  private getErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === 'string') return error;
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+
+  private isAccessibilityScreenshotUnsupportedError(error: unknown): boolean {
+    const message = this.getErrorMessage(error).toLowerCase();
+    return /android 11 or higher|accessibility screenshot requires|accessibility screenshot .*supported|not supported/.test(message);
+  }
+
+  private markAccessibilityScreenshotUnsupported(reason?: unknown): void {
+    this.accessibilityScreenshotSupported = false;
+    if (this.loggedAccessibilityScreenshotUnsupported) return;
+
+    this.loggedAccessibilityScreenshotUnsupported = true;
+    logger.info('[Proactive] Accessibility screenshot unavailable; skipping proactive OCR on this device');
+    if (reason) {
+      logger.debug('[Proactive] Accessibility screenshot unsupported reason:', reason);
+    }
+  }
+
+  private async canUseAccessibilityScreenshot(): Promise<boolean> {
+    if (this.accessibilityScreenshotSupported !== null) {
+      return this.accessibilityScreenshotSupported;
+    }
+
+    if (typeof image.isAccessibilityScreenshotSupported !== 'function') {
+      this.accessibilityScreenshotSupported = true;
+      return true;
+    }
+
+    try {
+      const supported = await image.isAccessibilityScreenshotSupported();
+      this.accessibilityScreenshotSupported = supported;
+      if (!supported) {
+        this.markAccessibilityScreenshotUnsupported();
+      }
+      return supported;
+    } catch (error) {
+      logger.debug('[Proactive] Failed to query accessibility screenshot support:', error);
+      this.accessibilityScreenshotSupported = true;
+      return true;
+    }
+  }
 
   private async captureScreenText(): Promise<string> {
     if (typeof image === 'undefined' || typeof ocr === 'undefined') return '';
 
     try {
-      // Initialize OCR if needed (PP-OCRv3)
+      if (!(await this.canUseAccessibilityScreenshot())) {
+        return '';
+      }
+
       if (!ocr.isInitialized()) {
         await ocr.init();
       }
@@ -462,13 +533,16 @@ export class ProactiveBehavior extends EventEmitter {
       if (!bitmap) return '';
 
       const text = await ocr.recognizeText(bitmap, 0.5);
-      // Normalize: collapse blank lines, trim
       return (text ?? '')
         .split('\n')
-        .map(l => l.trim())
-        .filter(l => l.length > 0)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
         .join('\n');
     } catch (err) {
+      if (this.isAccessibilityScreenshotUnsupportedError(err)) {
+        this.markAccessibilityScreenshotUnsupported(err);
+        return '';
+      }
       logger.debug('[Proactive] OCR failed:', err);
       return '';
     }
@@ -482,7 +556,7 @@ export class ProactiveBehavior extends EventEmitter {
     try {
       const all = await notificationListener.getActiveNotifications();
       const watched = new Set(this.config.watchedPackages);
-      return all.filter(n => watched.has(n.packageName));
+      return all.filter((n) => watched.has(n.packageName));
     } catch {
       return [];
     }
@@ -490,16 +564,18 @@ export class ProactiveBehavior extends EventEmitter {
 
   private async getBattery(): Promise<{ level: number; isCharging: boolean } | null> {
     if (typeof device === 'undefined') return null;
-    try { return await device.getBatteryInfo(); } catch { return null; }
+    try {
+      return await device.getBatteryInfo();
+    } catch {
+      return null;
+    }
   }
-
-  // ─── AI call ──────────────────────────────────────────────────────────────
 
   private async callAI(prompt: string): Promise<string | null> {
     if (!this.aiGenerator) return null;
     try {
       this.lastAICallTime = Date.now();
-      logger.info('[Proactive] Calling AI for environmental analysis…');
+      logger.info('[Proactive] Calling AI for environmental analysis');
       const raw = await this.aiGenerator(prompt);
       if (!raw || raw.trim() === 'NO_MESSAGE') return null;
       return raw.trim();
@@ -508,8 +584,6 @@ export class ProactiveBehavior extends EventEmitter {
       return null;
     }
   }
-
-  // ─── Utilities ────────────────────────────────────────────────────────────
 
   private isQuietHours(): boolean {
     const hour = new Date().getHours();

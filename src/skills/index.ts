@@ -1,16 +1,10 @@
 /**
- * Skills System - Index
+ * Skills System - Progressive Disclosure
  *
- * Re-exports for the skills module
+ * Skills are Markdown instruction files that the AI loads on-demand.
+ * Only name + description are kept in memory; full content is read when needed.
  */
 
-export { SkillManager } from './SkillManager.js';
-export { builtinSkills } from './builtin.js';
-export type {
-  Skill,
-  SkillResult,
-  SkillRegistration,
-  SkillContext,
-  SkillParameter,
-  SkillStep,
-} from './types.js';
+export { SkillStore } from './SkillStore.js';
+export { SkillFrontmatterSchema } from './types.js';
+export type { SkillEntry, SkillFrontmatter, SkillsConfig } from './types.js';
