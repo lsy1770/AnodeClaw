@@ -10,12 +10,10 @@ tests/
 *.spec.ts
 src/test-*.ts
 
-# Design documents (keep only README.md and CLAUDE.md)
-ACS-ClawdBot-Development-Plan.md
-Advanced-Features-Design.md
-Operational-Patterns-Design.md
-OpenClaw.md
-PROJECT-STATUS.md
+# Root markdown documents (keep only README files)
+/*.md
+!/README.md
+!/README_CN.md
 
 # IDE
 .vscode/
