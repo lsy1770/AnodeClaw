@@ -28,6 +28,7 @@
   <a href="#features">Features</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#social-adapters">Social Adapters</a>
+  <a href="https://t.me/anodeScripts">[#Telegram Channel]</a>
 </p>
 
 ---
